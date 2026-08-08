@@ -24,6 +24,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Pre-load CF cookies from environment variable ────────────────────────────
+# CF_COOKIES_JSON env var can be set with a JSON string of cookies
+# e.g. CF_COOKIES_JSON='{"cf_clearance":"abc123","__cf_bm":"xyz789"}'
+# This allows deploying with pre-solved cookies without needing Playwright
+_cf_cookies_env = os.environ.get("CF_COOKIES_JSON", "")
+if _cf_cookies_env:
+    try:
+        _cf_cookies = json.loads(_cf_cookies_env)
+        _cf_cookie_ts = time.time()
+        print(f"[CF-Bypass] Loaded {len(_cf_cookies)} cookies from CF_COOKIES_JSON env var")
+    except json.JSONDecodeError:
+        print("[CF-Bypass] Failed to parse CF_COOKIES_JSON env var")
+        _cf_cookies = {}
+        _cf_cookie_ts = 0
+else:
+    _cf_cookies = {}
+    _cf_cookie_ts = 0
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Referer": "https://www.miruro.tv/",
@@ -46,9 +64,8 @@ MIRURO_PIPE_URL = "https://www.miruro.tv/api/secure/pipe"
 # We use Playwright (headless Chromium) to visit miruro.tv once, solve the
 # challenge, and extract CF cookies. These cookies are cached and reused
 # for all pipe requests. Refreshed every 30 minutes or on 403.
+# _cf_cookies and _cf_cookie_ts are initialized above (from CF_COOKIES_JSON env var)
 
-_cf_cookies: dict = {}       # {"cf_clearance": "...", ...}
-_cf_cookie_ts: float = 0    # When cookies were last refreshed
 _CF_COOKIE_TTL = 1800       # 30 minutes
 
 async def _solve_cf_challenge() -> dict:
