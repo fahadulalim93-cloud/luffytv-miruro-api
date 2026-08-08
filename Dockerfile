@@ -1,3 +1,4 @@
+# Miruro API v3.0 — forced rebuild
 FROM python:3.12-slim AS builder
 WORKDIR /app
 COPY requirements.txt ./
@@ -13,7 +14,8 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY main.py ./
 
+# Coolify sets PORT env var — use it if available, fallback to 8000
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT} --workers 2"]
