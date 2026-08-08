@@ -1,4 +1,4 @@
-import base64, json, gzip, httpx, os
+import base64, json, gzip, httpx, os, time, asyncio
 from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="Miruro API", version="3.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="Miruro API", version="3.1", docs_url=None, redoc_url=None)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,6 +34,92 @@ HEADERS = {
 }
 ANILIST_URL = "https://graphql.anilist.co"
 MIRURO_PIPE_URL = "https://www.miruro.tv/api/secure/pipe"
+
+# ─── Cloudflare Turnstile Bypass via Playwright ────────────────────────────
+# miruro.tv uses CF Turnstile JS challenge. curl_cffi can't solve it.
+# We use Playwright (headless Chromium) to visit miruro.tv once, solve the
+# challenge, and extract CF cookies. These cookies are cached and reused
+# for all pipe requests. Refreshed every 30 minutes or on 403.
+
+_cf_cookies: dict = {}       # {"cf_clearance": "...", ...}
+_cf_cookie_ts: float = 0    # When cookies were last refreshed
+_CF_COOKIE_TTL = 1800       # 30 minutes
+
+async def _solve_cf_challenge() -> dict:
+    """Use Playwright headless browser to solve CF Turnstile challenge on miruro.tv."""
+    from playwright.async_api import async_playwright
+    print("[CF-Bypass] Launching Playwright to solve miruro.tv CF challenge...")
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+            ctx = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 720},
+            )
+            page = await ctx.new_page()
+            await page.goto("https://www.miruro.tv/", wait_until="networkidle", timeout=30000)
+            # Wait for CF challenge to resolve (page should load anime content)
+            await page.wait_for_timeout(3000)
+            # Extract cookies
+            cookies = await ctx.cookies()
+            cf_cookies = {}
+            for c in cookies:
+                if "miruro" in c.get("domain", ""):
+                    cf_cookies[c["name"]] = c["value"]
+            await browser.close()
+            if cf_cookies:
+                print(f"[CF-Bypass] Got {len(cf_cookies)} cookies from miruro.tv")
+                return cf_cookies
+            else:
+                print("[CF-Bypass] No miruro cookies found — CF challenge may not have been solved")
+                return {}
+    except Exception as e:
+        print(f"[CF-Bypass] Playwright error: {e}")
+        return {}
+
+async def _get_cf_cookies() -> dict:
+    """Get cached CF cookies, refreshing if expired or missing."""
+    global _cf_cookies, _cf_cookie_ts
+    now = time.time()
+    if _cf_cookies and (now - _cf_cookie_ts) < _CF_COOKIE_TTL:
+        return _cf_cookies
+    # Refresh cookies
+    new_cookies = await _solve_cf_challenge()
+    if new_cookies:
+        _cf_cookies = new_cookies
+        _cf_cookie_ts = now
+    return _cf_cookies
+
+async def _pipe_get(url: str) -> 'curl_cffi.requests.Response':
+    """GET request to Miruro pipe with CF cookie bypass."""
+    global _cf_cookies, _cf_cookie_ts
+    headers = {**HEADERS}
+    
+    # Try with cached cookies first
+    cookies = await _get_cf_cookies()
+    if cookies:
+        cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+        headers["Cookie"] = cookie_str
+    
+    async with AsyncSession(impersonate="chrome131") as client:
+        res = await client.get(url, headers=headers)
+    
+    # If 403, cookies expired — refresh and retry once
+    if res.status_code == 403 and cookies:
+        print("[CF-Bypass] Got 403 — cookies expired, refreshing...")
+        new_cookies = await _solve_cf_challenge()
+        if new_cookies:
+            _cf_cookies = new_cookies
+            _cf_cookie_ts = time.time()
+            cookie_str = "; ".join(f"{k}={v}" for k, v in new_cookies.items())
+            headers2 = {**HEADERS, "Cookie": cookie_str}
+            async with AsyncSession(impersonate="chrome131") as client:
+                res = await client.get(url, headers=headers2)
+    
+    return res
 
 def _proxy_img(url: str) -> str:
     return url
@@ -74,13 +160,12 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    async with AsyncSession(impersonate="chrome131") as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
-        data = _decode_pipe_response(res.text.strip())
-        _deep_translate(data)
-        return data
+    res = await _pipe_get(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
+    data = _decode_pipe_response(res.text.strip())
+    _deep_translate(data)
+    return data
 
 MEDIA_LIST_FIELDS = """
     id
@@ -665,11 +750,10 @@ async def get_sources(
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    async with AsyncSession(impersonate="chrome131") as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
-        return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
+    res = await _pipe_get(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    if res.status_code != 200:
+        raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
+    return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
