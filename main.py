@@ -6,6 +6,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
 
+# ─── Timeout Constants ─────────────────────────────────────────────────────────
+PIPE_TIMEOUT = 15          # seconds for curl_cffi pipe requests
+CF_SOLVE_TIMEOUT = 25     # seconds for Playwright CF challenge solving
+EPISODES_TIMEOUT = 20     # total timeout for /episodes endpoint
+SOURCES_TIMEOUT = 20      # total timeout for /sources endpoint
+
 load_dotenv()
 
 app = FastAPI(title="Miruro API", version="3.1", docs_url=None, redoc_url=None)
@@ -50,20 +56,57 @@ async def _solve_cf_challenge() -> dict:
     from playwright.async_api import async_playwright
     print("[CF-Bypass] Launching Playwright to solve miruro.tv CF challenge...")
     try:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-            )
-            ctx = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                viewport={"width": 1280, "height": 720},
-            )
-            page = await ctx.new_page()
-            await page.goto("https://www.miruro.tv/", wait_until="networkidle", timeout=30000)
-            # Wait for CF challenge to resolve (page should load anime content)
-            await page.wait_for_timeout(3000)
-            # Extract cookies
+        # Wrap in asyncio.wait_for to enforce a hard timeout
+        return await asyncio.wait_for(_solve_cf_challenge_inner(), timeout=CF_SOLVE_TIMEOUT)
+    except asyncio.TimeoutError:
+        print(f"[CF-Bypass] Playwright timed out after {CF_SOLVE_TIMEOUT}s")
+        return {}
+    except Exception as e:
+        print(f"[CF-Bypass] Playwright error: {e}")
+        return {}
+
+async def _solve_cf_challenge_inner() -> dict:
+    """Inner CF challenge solver — separated for timeout wrapping."""
+    from playwright.async_api import async_playwright
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled",
+                  "--window-size=1280,720"],
+        )
+        ctx = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            viewport={"width": 1280, "height": 720},
+        )
+        page = await ctx.new_page()
+        try:
+            await page.goto("https://www.miruro.tv/", wait_until="domcontentloaded", timeout=20000)
+            # Wait for CF challenge to resolve — check for actual content
+            # Instead of fixed wait, poll for cf_clearance cookie or anime content
+            for attempt in range(10):  # up to 10s
+                await page.wait_for_timeout(1000)
+                cookies = await ctx.cookies()
+                cf_cookies = {}
+                for c in cookies:
+                    if "miruro" in c.get("domain", ""):
+                        cf_cookies[c["name"]] = c["value"]
+                # Check if we got cf_clearance — that means challenge is solved
+                if "cf_clearance" in cf_cookies:
+                    print(f"[CF-Bypass] Got cf_clearance cookie (attempt {attempt+1})")
+                    await browser.close()
+                    return cf_cookies
+                # Also check if page has actual content (not just challenge page)
+                try:
+                    title = await page.title()
+                    if title and "moment" not in title.lower() and "challenge" not in title.lower():
+                        print(f"[CF-Bypass] Page loaded with title: {title}")
+                        if cf_cookies:
+                            await browser.close()
+                            return cf_cookies
+                except:
+                    pass
+            # If we didn't get cf_clearance but got other cookies, try them
             cookies = await ctx.cookies()
             cf_cookies = {}
             for c in cookies:
@@ -71,14 +114,13 @@ async def _solve_cf_challenge() -> dict:
                     cf_cookies[c["name"]] = c["value"]
             await browser.close()
             if cf_cookies:
-                print(f"[CF-Bypass] Got {len(cf_cookies)} cookies from miruro.tv")
-                return cf_cookies
+                print(f"[CF-Bypass] Got {len(cf_cookies)} cookies (no cf_clearance)")
             else:
                 print("[CF-Bypass] No miruro cookies found — CF challenge may not have been solved")
-                return {}
-    except Exception as e:
-        print(f"[CF-Bypass] Playwright error: {e}")
-        return {}
+            return cf_cookies
+        except Exception as e:
+            await browser.close()
+            raise e
 
 async def _get_cf_cookies() -> dict:
     """Get cached CF cookies, refreshing if expired or missing."""
@@ -94,30 +136,56 @@ async def _get_cf_cookies() -> dict:
     return _cf_cookies
 
 async def _pipe_get(url: str) -> 'curl_cffi.requests.Response':
-    """GET request to Miruro pipe with CF cookie bypass."""
+    """GET request to Miruro pipe with CF cookie bypass + timeout protection."""
     global _cf_cookies, _cf_cookie_ts
     headers = {**HEADERS}
     
     # Try with cached cookies first
-    cookies = await _get_cf_cookies()
+    try:
+        cookies = await asyncio.wait_for(_get_cf_cookies(), timeout=CF_SOLVE_TIMEOUT + 5)
+    except asyncio.TimeoutError:
+        print("[CF-Bypass] Cookie refresh timed out, proceeding without cookies")
+        cookies = {}
+    
     if cookies:
         cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
         headers["Cookie"] = cookie_str
     
-    async with AsyncSession(impersonate="chrome131") as client:
-        res = await client.get(url, headers=headers)
+    try:
+        async with AsyncSession(impersonate="chrome131") as client:
+            res = await client.get(url, headers=headers, timeout=PIPE_TIMEOUT)
+    except Exception as e:
+        print(f"[pipe-get] curl_cffi error: {e}")
+        # Return a fake response with error info
+        class FakeResponse:
+            status_code = 502
+            text = f"curl_cffi error: {e}"
+            headers = {}
+        return FakeResponse()
     
     # If 403, cookies expired — refresh and retry once
-    if res.status_code == 403 and cookies:
-        print("[CF-Bypass] Got 403 — cookies expired, refreshing...")
-        new_cookies = await _solve_cf_challenge()
+    if res.status_code == 403:
+        print("[CF-Bypass] Got 403 — cookies expired or missing, refreshing...")
+        try:
+            new_cookies = await asyncio.wait_for(_solve_cf_challenge(), timeout=CF_SOLVE_TIMEOUT + 5)
+        except asyncio.TimeoutError:
+            print("[CF-Bypass] CF challenge refresh timed out")
+            new_cookies = {}
         if new_cookies:
             _cf_cookies = new_cookies
             _cf_cookie_ts = time.time()
             cookie_str = "; ".join(f"{k}={v}" for k, v in new_cookies.items())
             headers2 = {**HEADERS, "Cookie": cookie_str}
-            async with AsyncSession(impersonate="chrome131") as client:
-                res = await client.get(url, headers=headers2)
+            try:
+                async with AsyncSession(impersonate="chrome131") as client:
+                    res = await client.get(url, headers=headers2, timeout=PIPE_TIMEOUT)
+            except Exception as e:
+                print(f"[pipe-get] retry curl_cffi error: {e}")
+                class FakeResponse:
+                    status_code = 502
+                    text = f"curl_cffi retry error: {e}"
+                    headers = {}
+                return FakeResponse()
     
     return res
 
@@ -152,6 +220,7 @@ def _inject_source_slugs(data: dict, anilist_id: int):
     return data
 
 async def _fetch_raw_episodes(anilist_id: int) -> dict:
+    """Fetch raw episodes with timeout protection."""
     payload = {
         "path": "episodes",
         "method": "GET",
@@ -160,10 +229,37 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    res = await _pipe_get(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    pipe_url = f"{MIRURO_PIPE_URL}?e={encoded_req}"
+    
+    try:
+        res = await asyncio.wait_for(_pipe_get(pipe_url), timeout=EPISODES_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail={
+            "error": "Episodes request timed out",
+            "detail": f"Pipe request for anilistId={anilist_id} timed out after {EPISODES_TIMEOUT}s. "
+                      f"Cloudflare challenge on miruro.tv may be blocking the request.",
+            "anilistId": anilist_id,
+        })
+    
     if res.status_code != 200:
-        raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
-    data = _decode_pipe_response(res.text.strip())
+        # Check if we got a CF challenge page instead of data
+        body_preview = res.text[:500] if hasattr(res, 'text') else ''
+        is_cf_challenge = 'Just a moment' in body_preview or 'challenge' in body_preview.lower()
+        raise HTTPException(status_code=res.status_code, detail={
+            "status": res.status_code,
+            "body": body_preview,
+            "cf_challenge": is_cf_challenge,
+            "error": "Cloudflare challenge blocked the request" if is_cf_challenge else "Pipe request failed",
+            "anilistId": anilist_id,
+        })
+    try:
+        data = _decode_pipe_response(res.text.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail={
+            "error": "Failed to decode pipe response",
+            "detail": str(e),
+            "anilistId": anilist_id,
+        })
     _deep_translate(data)
     return data
 
@@ -318,7 +414,26 @@ async def _anilist_query(query: str, variables: dict = None):
 
 @app.get("/")
 async def home():
-    return {"api": "Miruro API", "version": "3.0", "status": "running", "endpoints": ["/episodes/{anilist_id}", "/watch/{provider}/{anilist_id}/{category}/{slug}", "/sources", "/search", "/info/{anilist_id}", "/trending", "/popular", "/recent", "/schedule"]}
+    return {"api": "Miruro API", "version": "3.1", "status": "running", "endpoints": ["/episodes/{anilist_id}", "/watch/{provider}/{anilist_id}/{category}/{slug}", "/sources", "/search", "/info/{anilist_id}", "/trending", "/popular", "/recent", "/schedule"], "cf_cookies": bool(_cf_cookies), "cf_cookie_age": round(time.time() - _cf_cookie_ts, 1) if _cf_cookie_ts else 0}
+
+@app.get("/health")
+async def health_check():
+    """Health check — tests if miruro.tv pipe is accessible."""
+    try:
+        # Quick test: try to access the pipe with current cookies
+        payload = {"path": "episodes", "method": "GET", "query": {"anilistId": 1}, "body": None, "version": "0.1.0"}
+        encoded = _encode_pipe_request(payload)
+        res = await asyncio.wait_for(_pipe_get(f"{MIRURO_PIPE_URL}?e={encoded}"), timeout=10)
+        return {
+            "status": "ok" if res.status_code == 200 else "degraded",
+            "pipe_status": res.status_code,
+            "cf_cookies_loaded": bool(_cf_cookies),
+            "cf_cookie_age_seconds": round(time.time() - _cf_cookie_ts, 1) if _cf_cookie_ts else 0,
+        }
+    except asyncio.TimeoutError:
+        return {"status": "degraded", "pipe_status": "timeout", "cf_cookies_loaded": bool(_cf_cookies), "cf_cookie_age_seconds": round(time.time() - _cf_cookie_ts, 1) if _cf_cookie_ts else 0}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "cf_cookies_loaded": bool(_cf_cookies)}
 
 @app.get("/search")
 async def search_anime(
@@ -750,10 +865,30 @@ async def get_sources(
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    res = await _pipe_get(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    pipe_url = f"{MIRURO_PIPE_URL}?e={encoded_req}"
+    
+    try:
+        res = await asyncio.wait_for(_pipe_get(pipe_url), timeout=SOURCES_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail={
+            "error": "Sources request timed out",
+            "detail": f"Pipe request timed out after {SOURCES_TIMEOUT}s. Cloudflare challenge may be blocking.",
+        })
+    
     if res.status_code != 200:
-        raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
-    return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
+        body_preview = res.text[:500] if hasattr(res, 'text') else ''
+        is_cf_challenge = 'Just a moment' in body_preview or 'challenge' in body_preview.lower()
+        raise HTTPException(status_code=res.status_code, detail={
+            "status": res.status_code,
+            "body": body_preview,
+            "cf_challenge": is_cf_challenge,
+            "error": "Cloudflare challenge blocked the request" if is_cf_challenge else "Pipe request failed",
+        })
+    try:
+        data = _decode_pipe_response(res.text.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=502, detail={"error": "Failed to decode pipe response", "detail": str(e)})
+    return _proxy_deep_images(data)
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):
