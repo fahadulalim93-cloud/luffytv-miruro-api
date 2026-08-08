@@ -435,6 +435,41 @@ async def health_check():
     except Exception as e:
         return {"status": "error", "error": str(e), "cf_cookies_loaded": bool(_cf_cookies)}
 
+@app.post("/cf-cookies")
+async def set_cf_cookies(cookies: dict):
+    """Manually set CF cookies (e.g., from browser DevTools).
+    
+    Usage: POST /cf-cookies {"cf_clearance": "...", "other_cookie": "..."}
+    
+    To get cookies from your browser:
+    1. Visit https://www.miruro.tv/ in Chrome
+    2. Open DevTools > Application > Cookies > https://www.miruro.tv
+    3. Copy cf_clearance and any other miruro.tv cookies
+    4. POST them here
+    """
+    global _cf_cookies, _cf_cookie_ts
+    if not cookies:
+        raise HTTPException(status_code=400, detail="No cookies provided")
+    _cf_cookies = cookies
+    _cf_cookie_ts = time.time()
+    return {"status": "ok", "cookies_set": list(cookies.keys()), "message": "CF cookies updated. Episodes endpoint should now work."}
+
+@app.post("/solve-cf")
+async def trigger_cf_solve():
+    """Manually trigger CF challenge solving via Playwright."""
+    global _cf_cookies, _cf_cookie_ts
+    try:
+        new_cookies = await asyncio.wait_for(_solve_cf_challenge(), timeout=CF_SOLVE_TIMEOUT + 5)
+        if new_cookies:
+            _cf_cookies = new_cookies
+            _cf_cookie_ts = time.time()
+            return {"status": "ok", "cookies_found": list(new_cookies.keys()), "message": "CF challenge solved successfully"}
+        return {"status": "failed", "message": "Playwright could not solve CF challenge — try /cf-cookies endpoint to set manually"}
+    except asyncio.TimeoutError:
+        return {"status": "timeout", "message": f"CF solve timed out after {CF_SOLVE_TIMEOUT}s — try /cf-cookies endpoint to set manually"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
 @app.get("/search")
 async def search_anime(
     query: str,
