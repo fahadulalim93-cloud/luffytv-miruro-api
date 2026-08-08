@@ -6,18 +6,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc libcurl4-op
     pip install --no-cache-dir -r requirements.txt && \
     apt-get purge -y gcc && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
 
-FROM python:3.12-slim
+FROM mcr.microsoft.com/playwright/python:v1.53.0-noble
 WORKDIR /app
 
-# Install curl_cffi runtime lib + Playwright Chromium with all deps
+# Install curl_cffi runtime lib
 RUN apt-get update && apt-get install -y --no-install-recommends libcurl4 && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin /usr/local/bin
-
-# Install Playwright Chromium — --with-deps handles all system libs automatically
-RUN playwright install chromium --with-deps
 
 COPY main.py ./
 
