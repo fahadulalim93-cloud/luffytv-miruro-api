@@ -1,0 +1,19 @@
+{
+  "name": "animex-scraper",
+  "version": "1.0.0",
+  "description": "AnimeX.one scraper API — all providers, AniList routing, ready for VPS deployment",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "cors": "^2.8.5",
+    "node-fetch": "^3.3.2"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
