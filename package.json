@@ -1,15 +1,16 @@
 {
   "name": "luffytv-miruro-api",
-  "version": "5.0.0",
-  "description": "LuffyTV API — Animex + MKissa providers, AniList routing, HLS proxy, m3u8/mp4 sources",
+  "version": "6.0.0",
+  "description": "LuffyTV API — Animex + KAA + MKissa providers, AniList routing, HLS proxy, m3u8/mp4 sources",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.21.0",
-    "cors": "^2.8.5"
+    "got-scraping": "^4.2.1"
   },
   "type": "module",
   "engines": {

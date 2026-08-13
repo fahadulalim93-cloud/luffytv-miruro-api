@@ -1,16 +1,18 @@
 /**
- * LuffyTV Miruro API — Combined Server v5.0
+ * LuffyTV Miruro API — Combined Server v6.0
  *
- * TWO providers running in parallel:
+ * THREE providers running in parallel:
  *   - /animex/*  — animex.one (pp.animex.one + chad.anidap.lol fallback, 429 retry)
  *   - /mkissa/*  — mkissa.to (encrypted API, multi-embed extractor, m3u8/mp4)
+ *   - /kaa/*     — kaa.lt (fsearch API, episode servers, HLS via krussdomi)
  *
- * Unified routes (/search, /anilist/:id/stream) try BOTH providers.
+ * Unified routes (/search, /anilist/:id/episodes) try ALL providers.
  */
 
 import express from "express";
 import cors from "cors";
 import crypto from "node:crypto";
+import { gotScraping } from "got-scraping";
 
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);
@@ -25,6 +27,69 @@ class Throttler {
   constructor(max = 2) { this.max = max; this.running = 0; this.queue = []; }
   async acquire() { if (this.running < this.max) { this.running++; return; } return new Promise(r => this.queue.push(r)); }
   release() { this.running--; if (this.queue.length > 0) { this.running++; this.queue.shift()(); } }
+}
+
+// ─── Shared Utilities ──────────────────────────────────────────────────────────
+function diceCoeff(a, b) {
+  if (!a || !b) return 0;
+  const norm = s => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  const na = norm(a), nb = norm(b);
+  if (na === nb) return 1;
+  if (na.length < 2 || nb.length < 2) return 0;
+  const bigrams = s => { const m = new Map(); for (let i = 0; i < s.length - 1; i++) { const bg = s.slice(i, i + 2); m.set(bg, (m.get(bg) || 0) + 1); } return m; };
+  const ba = bigrams(na), bb = bigrams(nb);
+  let inter = 0;
+  for (const [k, v] of ba) inter += Math.min(v, bb.get(k) || 0);
+  return (2 * inter) / (na.length - 1 + nb.length - 1);
+}
+
+async function fetchAniListMedia(anilistId) {
+  try {
+    const q = "query($id:Int!){Media(id:$id,type:ANIME){id seasonYear format episodes status startDate{year}title{romaji english native}synonyms coverImage{large}}}";
+    const res = await fetch("https://graphql.anilist.co", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ query: q, variables: { id: Number(anilistId) } }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()).data?.Media ?? null;
+  } catch { return null; }
+}
+
+async function fetchAniZip(anilistId) {
+  try {
+    const res = await fetch(`https://api.ani.zip/mappings?anilist_id=${anilistId}`);
+    if (!res.ok) return null;
+    return res.json();
+  } catch { return null; }
+}
+
+function buildTitles(media, anizip) {
+  const titles = new Set();
+  if (media?.title) {
+    if (media.title.romaji) titles.add(media.title.romaji);
+    if (media.title.english) titles.add(media.title.english);
+    if (media.title.native) titles.add(media.title.native);
+  }
+  if (Array.isArray(media?.synonyms)) media.synonyms.forEach(s => s && titles.add(s));
+  if (anizip?.titles) {
+    for (const [k, v] of Object.entries(anizip.titles)) {
+      if (v) titles.add(v);
+    }
+  }
+  return [...titles];
+}
+
+function episodeMetaFromAnizip(num, anizip) {
+  const ep = anizip?.episodes?.[String(num)] ?? {};
+  return {
+    title: ep.title?.en || ep.title?.["x-jat"] || null,
+    duration: ep.runtime ?? ep.length ?? null,
+    image: ep.image ?? null,
+    description: ep.overview?.en ?? null,
+    airDate: ep.airdate ?? null,
+    filler: ep.filler ?? null,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -68,26 +133,332 @@ async function axRest(path, retries = 2) {
 }
 
 async function axSearch(q) {
-  const d = await axGql(`query($s:String!){search(search:$s){id slug title coverImage{large}format episodes status}}`, { s: q });
-  return (d.search || []).map(a => ({ id: a.id, slug: a.slug, title: a.title, image: a.coverImage?.large, type: a.format, episodes: a.episodes, status: a.status }));
+  const d = await axGql(`query($q:String!){searchAnime(query:$q){items{id anilistId titleRomaji titleEnglish coverImage format episodeCount status}}}`, { q });
+  return (d.searchAnime?.items || []).map(a => ({ id: a.id, slug: a.id, title: a.titleRomaji || a.titleEnglish, image: typeof a.coverImage === "string" ? a.coverImage : a.coverImage?.large || a.coverImage?.medium, type: a.format, episodes: a.episodeCount, status: a.status }));
 }
 
 async function axAnilistToSlug(alId) {
-  const d = await axGql(`query($id:Int!){Media(id:$id,type:ANIME){id slug title{romaji}coverImage{large}}}`, { id: alId });
-  if (!d.Media) return null;
-  return { id: d.Media.id, slug: d.Media.slug, title: d.Media.title?.romaji, image: d.Media.coverImage?.large };
+  const d = await axGql(`query($id:Int!){anime(anilistId:$id){id anilistId titleRomaji titleEnglish coverImage}}`, { id: alId });
+  if (!d.anime) return null;
+  return { id: d.anime.id, slug: d.anime.id, title: d.anime.titleRomaji || d.anime.titleEnglish, image: typeof d.anime.coverImage === "string" ? d.anime.coverImage : d.anime.coverImage?.large };
 }
 
 async function axEpisodes(slug) {
   const d = await axRest(`/episodes?id=${slug}`);
-  const eps = d?.episodes || d?.data || [];
-  return Array.isArray(eps) ? eps.map((e, i) => ({ number: e.number ?? (i + 1), title: e.title || `Episode ${e.number ?? (i + 1)}`, slug: e.slug || e.id || String(e.number ?? (i + 1)) })) : [];
+  const eps = Array.isArray(d) ? d : (d?.episodes || d?.data || []);
+  return eps.map((e, i) => ({ number: e.number ?? (i + 1), title: e.titles?.en || e.title || `Episode ${e.number ?? (i + 1)}`, slug: e.slug || e.id || String(e.number ?? (i + 1)), img: e.img, isFiller: e.isFiller, description: e.description }));
 }
 
-async function axSources(slug, ep) {
-  const d = await axRest(`/sources?id=${slug}&episode=${ep}`);
-  const srcs = d?.sources || d?.data || [];
-  return Array.isArray(srcs) ? srcs.map(s => ({ url: s.url || s.file, type: s.type || (s.url?.includes(".m3u8") ? "m3u8" : "mp4"), quality: s.quality || s.resolution || "auto", server: s.server || "animex" })) : [];
+async function axSource(slug, ep, providerId = "gogoanime", subType = "sub") {
+  const d = await axRest(`/sources?providerId=${providerId}&id=${slug}&epNum=${ep}&subType=${subType}`);
+  const srcs = Array.isArray(d) ? d : (d?.sources || d?.data || []);
+  return srcs.map(s => ({
+    url: s.url || s.file,
+    type: s.type?.includes("mpegurl") ? "m3u8" : (s.type || (s.url?.includes(".m3u8") ? "m3u8" : "mp4")),
+    quality: s.quality || s.resolution || "auto",
+    server: s.server || providerId,
+    headers: d?.headers || {},
+  }));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  KAA PROVIDER  —  kaa.lt (fsearch + episode servers, HLS via krussdomi)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const KAA_BASE     = "https://kaa.lt";
+const KAA_HLS_BASE = "https://hls.krussdomi.com/manifest";
+const KAA_UA       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const KAA_H        = { "User-Agent": KAA_UA, Accept: "application/json", Origin: "https://kaa.lt", Referer: "https://kaa.lt/" };
+const kaaThrottle  = new Throttler(3);
+
+async function kaaFetch(url, opts = {}) {
+  await kaaThrottle.acquire();
+  try {
+    const method = (opts.method || "GET").toUpperCase();
+    const gotOpts = {
+      method,
+      headers: { ...KAA_H, ...opts.headers },
+      timeout: { request: 15000 },
+      followRedirect: true,
+    };
+    if (opts.body) gotOpts.body = opts.body;
+    const r = await gotScraping(url, gotOpts);
+    if (r.statusCode >= 400) throw new Error(`KAA HTTP ${r.statusCode}: ${url}`);
+    return JSON.parse(r.body);
+  } finally { kaaThrottle.release(); }
+}
+
+async function kaaSearch(query) {
+  const data = await kaaFetch(`${KAA_BASE}/api/fsearch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ page: 1, query }),
+  });
+  return Array.isArray(data?.result) ? data.result : [];
+}
+
+async function kaaShowInfo(showSlug) {
+  return kaaFetch(`${KAA_BASE}/api/show/${showSlug}`);
+}
+
+async function kaaEpisodePage(showSlug, ep) {
+  return kaaFetch(`${KAA_BASE}/api/show/${showSlug}/episodes?ep=${ep}&lang=ja-JP`);
+}
+
+async function kaaAllEpisodes(showSlug) {
+  const first = await kaaEpisodePage(showSlug, 1);
+  const pages  = Array.isArray(first.pages)  ? first.pages  : [];
+  const all    = Array.isArray(first.result) ? [...first.result] : [];
+
+  if (pages.length > 1) {
+    const rest = await Promise.all(
+      pages.slice(1).map(async (pg) => {
+        const startEp = pg.eps?.[0];
+        if (!startEp) return [];
+        const d = await kaaEpisodePage(showSlug, startEp);
+        return Array.isArray(d.result) ? d.result : [];
+      })
+    );
+    for (const batch of rest) all.push(...batch);
+  }
+
+  return all;
+}
+
+async function kaaEpisodeServers(showSlug, fullEpSlug) {
+  return kaaFetch(`${KAA_BASE}/api/show/${showSlug}/episode/${fullEpSlug}`);
+}
+
+function buildKaaQueries(titles) {
+  const queries = new Set();
+  for (const title of titles.slice(0, 4)) {
+    if (/[\u3000-\u9fff\u4e00-\u9faf]/.test(title)) continue;
+    const clean = title.replace(/[^\w\s]/g, " ").replace(/\s+/g, " ").trim();
+    if (!clean || clean.length < 3) continue;
+    const words = clean.split(" ").filter(Boolean);
+    if (words.length <= 3) {
+      queries.add(clean);
+    } else {
+      queries.add(words.slice(0, 2).join(" "));
+      queries.add(words.slice(0, 3).join(" "));
+    }
+  }
+  return [...queries];
+}
+
+function scoreKaaCandidate(candidate, titles, seasonYear, anilistFormat) {
+  const titleEn = candidate.title_en || "";
+  const titleJp = candidate.title   || "";
+  const kaaYear = Number(candidate.year);
+  const kaaType = (candidate.type || "").toLowerCase();
+
+  let base = 0;
+  for (const t of titles.slice(0, 3)) {
+    if (/[\u3000-\u9fff\u4e00-\u9faf]/.test(t)) continue;
+    base = Math.max(base, diceCoeff(t, titleEn), diceCoeff(t, titleJp));
+  }
+
+  let yearMult = 1.0;
+  if (seasonYear && kaaYear) {
+    const diff = Math.abs(Number(seasonYear) - kaaYear);
+    if (diff === 0)      yearMult = 1.2;
+    else if (diff === 1) yearMult = 0.8;
+    else                 yearMult = 0.5;
+  }
+
+  let typeMult = 1.0;
+  const af = (anilistFormat || "").toUpperCase();
+  if      (af === "MOVIE" && kaaType !== "movie")                        typeMult = 0.25;
+  else if (af !== "MOVIE" && kaaType === "movie")                        typeMult = 0.25;
+  else if ((af === "OVA" || af === "ONA" || af === "SPECIAL") && kaaType === "tv") typeMult = 0.5;
+  else if (af === "TV"   && (kaaType === "ova" || kaaType === "special")) typeMult = 0.5;
+
+  return Math.min(1, base * yearMult) * typeMult;
+}
+
+async function kaaResolveSeries(anilistId) {
+  const ck = `kaa-resolve:${anilistId}`;
+  const c = getCached(ck); if (c) return c;
+
+  const [media, anizip] = await Promise.all([fetchAniListMedia(anilistId), fetchAniZip(anilistId)]);
+  if (!media) throw new Error(`KAA: AniList media not found for ID ${anilistId}`);
+
+  const titles     = buildTitles(media, anizip);
+  const queries    = buildKaaQueries(titles);
+  const seasonYear = media?.seasonYear;
+  const format     = media?.format;
+
+  if (!queries.length) throw new Error(`KAA: no usable search queries for AniList ${anilistId}`);
+
+  const allCandidates = new Map();
+  await Promise.all(
+    queries.map(async (q) => {
+      try {
+        const results = await kaaSearch(q);
+        for (const r of results) {
+          if (!allCandidates.has(r.slug)) allCandidates.set(r.slug, r);
+        }
+      } catch {}
+    })
+  );
+
+  if (!allCandidates.size) throw new Error(`KAA: no search results for AniList ${anilistId}`);
+
+  const scored = [];
+  for (const [, candidate] of allCandidates) {
+    const score = scoreKaaCandidate(candidate, titles, seasonYear, format);
+    if (score >= 0.5) {
+      scored.push({
+        slug:    candidate.slug,
+        title:   candidate.title_en || candidate.title,
+        locales: Array.isArray(candidate.locales) ? candidate.locales : [],
+        score,
+      });
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+
+  if (!scored.length) {
+    throw new Error(`KAA: no confident match for AniList ${anilistId}`);
+  }
+
+  const best = scored[0];
+  if (best.score < 0.6) {
+    console.warn(`[KAA] Low confidence match for AniList ${anilistId} — "${best.slug}" score ${best.score.toFixed(3)}`);
+  }
+
+  const data = {
+    slug:    best.slug,
+    title:   best.title,
+    locales: best.locales,
+    score:   best.score,
+    media,
+    anizip,
+  };
+  setCache(ck, data);
+  return data;
+}
+
+async function kaaBuildEpMap(showSlug, showInfo) {
+  if (showInfo?.type === "movie") {
+    const m = (showInfo.watch_uri || "").match(/\/(ep-(\d+)-([a-f0-9]+))$/i);
+    if (m) return [{ number: 1, fullSlug: m[1] }];
+    return [];
+  }
+  const episodes = await kaaAllEpisodes(showSlug);
+  return episodes.map((e) => ({
+    number:   e.episode_number,
+    fullSlug: `ep-${e.episode_number}-${e.slug}`,
+    title:    e.title,
+    duration: e.duration_ms ? Math.round(e.duration_ms / 1000) : null,
+  }));
+}
+
+async function kaaGetEpisodes(anilistId) {
+  const ck = `kaa-episodes:${anilistId}`;
+  const c = getCached(ck); if (c) return c;
+
+  const series   = await kaaResolveSeries(anilistId);
+  const showInfo = await kaaShowInfo(series.slug);
+
+  const locales = Array.isArray(showInfo.locales) ? showInfo.locales : series.locales;
+  const hasDub  = locales.includes("en-US");
+
+  const epMap = await kaaBuildEpMap(series.slug, showInfo);
+  if (!epMap.length) throw new Error(`KAA: no episodes found for AniList ${anilistId} (slug: ${series.slug})`);
+
+  const anizip  = series.anizip;
+  const maxEp   = series.media?.episodes || 0;
+  const sub     = [];
+  const dub     = [];
+
+  for (const ep of epMap) {
+    const num = ep.number;
+    if (!Number.isFinite(num) || num < 1)   continue;
+    if (maxEp && num > maxEp)               continue;
+    const meta  = episodeMetaFromAnizip(num, anizip);
+    const base  = {
+      number:      num,
+      title:       meta.title       ?? ep.title ?? `Episode ${num}`,
+      duration:    meta.duration    ?? ep.duration,
+      filler:      meta.filler,
+      description: meta.description,
+      image:       meta.image,
+      airDate:     meta.airDate,
+    };
+    sub.push({ id: `kaa/${anilistId}/sub/kaa-${num}`, ...base, audio: "sub" });
+    if (hasDub) {
+      dub.push({ id: `kaa/${anilistId}/dub/kaa-${num}`, ...base, audio: "dub" });
+    }
+  }
+
+  const result = {
+    anilistId: Number(anilistId),
+    meta: {
+      id:         series.slug,
+      title:      series.title,
+      source:     "kaa",
+      matchScore: Number(series.score.toFixed(3)),
+    },
+    episodes: { sub, dub },
+  };
+  setCache(ck, result);
+  return result;
+}
+
+async function kaaHandleWatch(anilistId, audio, epNum) {
+  const ck = `kaa-watch:${anilistId}:${audio}:${epNum}`;
+  const c = getCached(ck); if (c) return c;
+
+  const series   = await kaaResolveSeries(anilistId);
+  const showInfo = await kaaShowInfo(series.slug);
+
+  const locales = Array.isArray(showInfo.locales) ? showInfo.locales : series.locales;
+  if (audio === "dub" && !locales.includes("en-US")) {
+    throw new Error(`KAA: no English dub for AniList ${anilistId}`);
+  }
+
+  const epMap = await kaaBuildEpMap(series.slug, showInfo);
+  const ep    = epMap.find((e) => e.number === Number(epNum));
+  if (!ep) {
+    throw new Error(`KAA: episode ${epNum} not found for AniList ${anilistId}`);
+  }
+
+  const episodeData = await kaaEpisodeServers(series.slug, ep.fullSlug);
+  const servers     = Array.isArray(episodeData.servers) ? episodeData.servers : [];
+  if (!servers.length) {
+    throw new Error(`KAA: no streams for episode ${epNum} (AniList ${anilistId})`);
+  }
+
+  const streams = [];
+  for (const s of servers) {
+    if (!s.src) continue;
+    const m = s.src.match(/[?&]id=([^&]+)/);
+    if (!m) continue;
+    streams.push({
+      url:        `${KAA_HLS_BASE}/${m[1]}/master.m3u8`,
+      playerUrl:  s.src,
+      type:       "hls",
+      server:     s.name || s.shortName || "KAA",
+      headers:    { Referer: "https://krussdomi.com/" },
+      priority:   1,
+      isActive:   true,
+    });
+  }
+
+  if (!streams.length) {
+    throw new Error(`KAA: could not resolve stream for episode ${epNum}`);
+  }
+
+  const result = {
+    anilistId: Number(anilistId),
+    episode:   Number(epNum),
+    audio,
+    streams,
+  };
+  setCache(ck, result);
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -359,8 +730,6 @@ async function mkWarmWatchPage(showId, show, epNum, audio) {
   try { await mkFetchWithTimeout(`${MK_REFERER}/anime/${slug}-${showId}/${audio}/${epNum}`, { headers: mkBrowserHeaders({ Accept: "text/html,*/*", Referer: `${MK_REFERER}/`, "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate" }) }, MK_FETCH_TIMEOUT); } catch {}
 }
 
-async function mkFetchAniZip(anilistId) { try { const res = await fetch(`${ANIZIP}?anilist_id=${anilistId}`); if (!res.ok) return null; return res.json(); } catch { return null; } }
-
 function mkNormalize(s) { return (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, ""); }
 function mkExtractYear(t) { if (!t) return null; const m = t.match(/\b(19\d{2}|20\d{2})\b/); return m ? parseInt(m[1]) : null; }
 
@@ -379,12 +748,8 @@ function mkFindBestMatch(results, titles, targetYear, targetId) {
   return best || results[0];
 }
 
-async function mkFetchAniListMedia(anilistId) {
-  try { const q = "query($id:Int){Media(id:$id,type:ANIME){seasonYear startDate{year}title{romaji english native}}}"; const res = await fetch("https://graphql.anilist.co", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ query: q, variables: { id: Number(anilistId) } }) }); if (!res.ok) return null; return (await res.json()).data?.Media ?? null; } catch { return null; }
-}
-
 async function mkResolveMkissaId(anilistId) {
-  const [anizipRes, alMedia] = await Promise.all([mkFetchAniZip(anilistId).catch(() => ({})), mkFetchAniListMedia(anilistId).catch(() => null)]);
+  const [anizipRes, alMedia] = await Promise.all([fetchAniZip(anilistId).catch(() => ({})), fetchAniListMedia(anilistId).catch(() => null)]);
   const anizip = anizipRes || {};
   let titlesToTry = [];
   if (anizip.titles) titlesToTry = [anizip.titles.en, anizip.titles.ja, anizip.titles["x-jat"], ...Object.values(anizip.titles)].filter(Boolean);
@@ -499,7 +864,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "5.0.0", providers: ["animex", "mkissa"], mkissaCrypto: mkCryptoConfigCache ? `ok (buildId: ${mkCryptoConfigCache.buildId})` : "pending" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "6.0.0", providers: ["animex", "kaa", "mkissa"], mkissaCrypto: mkCryptoConfigCache ? `ok (buildId: ${mkCryptoConfigCache.buildId})` : "pending" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -508,7 +873,12 @@ app.get("/hls-proxy", hlsProxy);
 app.get("/animex/search", async (req, res) => { try { res.json(await axSearch(req.query.q)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/animex/anilist/:id", async (req, res) => { try { const r = await axAnilistToSlug(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found" }); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/animex/episodes/:slug", async (req, res) => { try { res.json(await axEpisodes(req.params.slug)); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.get("/animex/sources/:slug/:ep", async (req, res) => { try { res.json(await axSources(req.params.slug, req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/animex/sources/:slug/:ep", async (req, res) => { try { res.json(await axSource(req.params.slug, req.params.ep, req.query.provider || "gogoanime", req.query.subType || "sub")); } catch (e) { res.status(502).json({ error: e.message }); } });
+
+// ─── KAA ROUTES ──────────────────────────────────────────────────────────────
+app.get("/kaa/search", async (req, res) => { try { const results = await kaaSearch(req.query.q || ""); res.json(results); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/kaa/episodes/:anilistId", async (req, res) => { try { res.json(await kaaGetEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/kaa/watch/:anilistId/:audio/:ep", async (req, res) => { try { res.json(await kaaHandleWatch(+req.params.anilistId, req.params.audio, +req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
 
 // ─── MKISSA ROUTES ────────────────────────────────────────────────────────────
 app.get("/mkissa/search", async (req, res) => { try { res.json(await mkSearch(req.query.q || "", req.query.mode || "sub")); } catch (e) { res.status(502).json({ error: e.message }); } });
@@ -518,23 +888,29 @@ app.get("/mkissa/watch/:anilistId/:audio/:ep", async (req, res) => { try { res.j
 // ─── UNIFIED ROUTES ───────────────────────────────────────────────────────────
 app.get("/search", async (req, res) => {
   const q = req.query.q; if (!q) return res.status(400).json({ error: "Missing ?q=" });
-  const results = { animex: [], mkissa: [] };
+  const results = { animex: [], kaa: [], mkissa: [] };
   try { results.animex = await axSearch(q); } catch (e) { results.animex = { error: e.message }; }
+  try { results.kaa = await kaaSearch(q); } catch (e) { results.kaa = { error: e.message }; }
   try { results.mkissa = await mkSearch(q); } catch (e) { results.mkissa = { error: e.message }; }
   res.json(results);
 });
 
 app.get("/anilist/:id/episodes", async (req, res) => {
-  const id = +req.params.id; const result = { animex: null, mkissa: null };
+  const id = +req.params.id; const result = { animex: null, kaa: null, mkissa: null };
   try { const m = await axAnilistToSlug(id); if (m) result.animex = { anime: m, episodes: await axEpisodes(m.slug) }; } catch (e) { result.animex = { error: e.message }; }
+  try { result.kaa = await kaaGetEpisodes(id); } catch (e) { result.kaa = { error: e.message }; }
   try { result.mkissa = await mkHandleEpisodes(id); } catch (e) { result.mkissa = { error: e.message }; }
   res.json(result);
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
+process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err?.message || err); });
+process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err?.message || err); });
+
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v5.0 on :${PORT}`);
+  console.log(`LuffyTV API v6.0 on :${PORT}`);
   console.log(`  Animex: ${AX_GQL} + ${AX_REST.join(", ")}`);
+  console.log(`  KAA:    ${KAA_BASE}`);
   console.log(`  MKissa: ${MK_REFERER} → ${MK_API}`);
   // Warm up MKissa crypto config
   mkDiscoverCryptoConfig().then(c => console.log(`[MKissa] Crypto config warmed up: buildId=${c.buildId}`)).catch(e => console.warn(`[MKissa] Crypto warmup failed: ${e.message}`));
