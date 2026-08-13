@@ -1,5 +1,5 @@
 /**
- * LuffyTV Miruro API — Combined Server v4.0
+ * LuffyTV Miruro API — Combined Server v4.1
  *
  * TWO providers running in parallel:
  *   - /animex/*  — animex.one (pp.animex.one + chad.anidap.lol fallback, 429 retry)
@@ -7,9 +7,10 @@
  *
  * Unified routes (/search, /anilist/:id/stream) try BOTH providers.
  *
- * FlareSolverr solves Cloudflare UAM challenges and returns cf_clearance cookies.
- * Cookies are cached and auto-refreshed on 401/403 or expiry.
- * Kwik embed pages are resolved via Node.js VM sandbox (mock Plyr/Hls → m3u8).
+ * CRITICAL: FlareSolverr makes ALL animepahe requests through its Chromium instance.
+ * cf_clearance cookies are tied to the TLS fingerprint, so we can't transfer them
+ * to got-scraping/axios. FlareSolverr's real Chrome handles both CF challenge AND
+ * the TLS fingerprint match. Sessions are persisted for speed.
  */
 
 import express from "express";
@@ -20,7 +21,7 @@ import { gotScraping } from "got-scraping";
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);
 const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || "http://localhost:8191/v1";
-const PAHE_COOKIES_ENV = process.env.PAHE_COOKIES || ""; // Manual cookie fallback: cf_clearance=xxx; __ddgid_=yyy
+const PAHE_SESSION = "animepahe"; // FlareSolverr session name for persistence
 
 // ─── Shared Cache ──────────────────────────────────────────────────────────────
 const cache = new Map();
@@ -32,13 +33,6 @@ class Throttler {
   constructor(max = 2) { this.max = max; this.running = 0; this.queue = []; }
   async acquire() { if (this.running < this.max) { this.running++; return; } return new Promise(r => this.queue.push(r)); }
   release() { this.running--; if (this.queue.length > 0) { this.running++; this.queue.shift()(); } }
-}
-
-// ─── Simple fetch helper ──────────────────────────────────────────────────────
-async function jsonFetch(url, opts = {}) {
-  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", ...opts.headers }, ...opts });
-  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
-  return res.json();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -105,140 +99,108 @@ async function axSources(slug, ep) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  ANIMEPAHE PROVIDER  —  FlareSolverr CF UAM bypass + Kwik m3u8
+//  ANIMEPAHE PROVIDER  —  FlareSolverr for ALL requests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const PAHE_BASE = process.env.ANIMEPAHE_BASE || "https://animepahe.com";
+const PAHE_BASE = process.env.ANIMEPAHE_BASE || "https://animepahe.pw";
 const ANILIST_API = "https://graphql.anilist.co";
 const paheThrottle = new Throttler(2);
 
-// ─── Cookie Manager ────────────────────────────────────────────────────────────
-let paheCookies = null;          // { cookieHeader: string, timestamp: number }
-let paheIsRefreshing = false;
-const PAHE_COOKIE_TTL = 4 * 60 * 60 * 1000; // 4 hours (cf_clearance usually lasts longer)
+// ─── FlareSolverr Session Manager ─────────────────────────────────────────────
+let fsSessionCreated = false;
+let fsLastError = null;
+let fsLastSuccess = 0;
 
-async function paheRefreshCookies() {
-  if (paheIsRefreshing) return paheCookies?.cookieHeader;
-  paheIsRefreshing = true;
-  try {
-    console.log("[Pahe] Refreshing CF cookies via FlareSolverr...");
-    const res = await fetch(FLARESOLVERR_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cmd: "request.get", url: PAHE_BASE, maxTimeout: 60000 }),
-      signal: AbortSignal.timeout(70000),
-    });
-    if (!res.ok) throw new Error(`FlareSolverr HTTP ${res.status}`);
-    const data = await res.json();
-
-    if (data.status !== "ok" || !data.solution) {
-      throw new Error(`FlareSolverr failed: ${data.message || "unknown"}`);
-    }
-
-    const cookies = data.solution.cookies || [];
-    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join("; ");
-    const userAgent = data.solution.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-
-    if (!cookieHeader) throw new Error("No cookies from FlareSolverr");
-
-    paheCookies = { cookieHeader, userAgent, timestamp: Date.now() };
-    console.log(`[Pahe] Got ${cookies.length} cookies from FlareSolverr (cf_clearance: ${cookies.find(c => c.name === "cf_clearance") ? "YES" : "NO"})`);
-    return cookieHeader;
-  } catch (err) {
-    console.error(`[Pahe] FlareSolverr error: ${err.message}`);
-    // If FlareSolverr fails, try got-scraping as fallback
-    try {
-      console.log("[Pahe] Trying got-scraping fallback...");
-      const resp = await gotScraping({ url: PAHE_BASE, headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" } });
-      const html = resp.body;
-      if (html && html.length > 500 && !html.includes("Just a moment") && !html.includes("Checking your browser")) {
-        const setCookies = resp.headers["set-cookie"];
-        if (setCookies) {
-          const cookieHeader = Array.isArray(setCookies) ? setCookies.map(c => c.split(";")[0]).join("; ") : setCookies.split(";")[0];
-          if (cookieHeader) {
-            paheCookies = { cookieHeader, userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", timestamp: Date.now() };
-            console.log("[Pahe] got-scraping fallback succeeded");
-            return cookieHeader;
-          }
-        }
-      }
-      throw new Error("got-scraping also blocked by CF");
-    } catch (fbErr) {
-      console.error(`[Pahe] All CF bypass methods failed: ${fbErr.message}`);
-      throw new Error(`CF bypass failed: ${err.message}`);
-    }
-  } finally {
-    paheIsRefreshing = false;
-  }
-}
-
-async function paheGetCookies() {
-  // Check for manually set cookies from environment variable
-  if (PAHE_COOKIES_ENV && !paheCookies) {
-    paheCookies = {
-      cookieHeader: PAHE_COOKIES_ENV,
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-      timestamp: Date.now(),
-    };
-    console.log("[Pahe] Using PAHE_COOKIES from environment variable");
-  }
-
-  if (paheCookies && (Date.now() - paheCookies.timestamp) < PAHE_COOKIE_TTL) {
-    // Proactive refresh if > 3.5 hours old (only for FlareSolverr-managed cookies, not env-set)
-    if (!PAHE_COOKIES_ENV && (Date.now() - paheCookies.timestamp) > (PAHE_COOKIE_TTL - 30 * 60 * 1000) && !paheIsRefreshing) {
-      paheRefreshCookies().catch(e => console.warn("[Pahe] Background cookie refresh failed:", e.message));
-    }
-    return paheCookies;
-  }
-  await paheRefreshCookies();
-  return paheCookies;
-}
-
-// ─── Pahe HTTP request with CF cookies ────────────────────────────────────────
-async function paheFetch(url, opts = {}) {
-  const { cookieHeader, userAgent } = await paheGetCookies();
-  const headers = {
-    "User-Agent": userAgent,
-    "Cookie": cookieHeader,
-    "Referer": PAHE_BASE + "/",
-    "Accept": opts.accept || "application/json, text/html, */*",
-    ...opts.headers,
-  };
-
+/**
+ * Make a request through FlareSolverr's Chromium instance.
+ * This is the ONLY way to bypass Cloudflare UAM — the real browser handles
+ * both the JS challenge AND the TLS fingerprint that cf_clearance is tied to.
+ *
+ * FlareSolverr uses persistent sessions so the browser stays open between requests.
+ */
+async function flaresolverrGet(url, maxTimeout = 30000) {
   await paheThrottle.acquire();
   try {
-    const resp = await gotScraping({
+    const body = {
+      cmd: "request.get",
       url,
-      headers,
-      followRedirect: true,
-      timeout: { request: 20000 },
-      ...opts.gotOpts,
-    });
+      maxTimeout,
+      session: PAHE_SESSION, // Persist browser session for speed
+    };
 
-    const body = resp.body;
-
-    // Check if we got a CF challenge page
-    if (body.includes("Just a moment") || body.includes("Checking your browser") || body.includes("challenge-platform")) {
-      console.warn("[Pahe] CF challenge detected, refreshing cookies...");
-      await paheRefreshCookies();
-      // Retry with fresh cookies
-      const fresh = await paheGetCookies();
-      const retryResp = await gotScraping({
-        url,
-        headers: { ...headers, Cookie: fresh.cookieHeader, "User-Agent": fresh.userAgent },
-        followRedirect: true,
-        timeout: { request: 20000 },
-        ...opts.gotOpts,
-      });
-      if (retryResp.body.includes("Just a moment") || retryResp.body.includes("Checking your browser")) {
-        throw new Error("Still blocked by CF after cookie refresh");
-      }
-      return retryResp;
+    // Only create session on first request
+    if (!fsSessionCreated) {
+      body.session = PAHE_SESSION;
+      fsSessionCreated = true;
     }
 
-    return resp;
+    const resp = await fetch(FLARESOLVERR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(maxTimeout + 15000),
+    });
+
+    if (!resp.ok) {
+      throw new Error(`FlareSolverr HTTP ${resp.status}: ${await resp.text().catch(() => "")}`);
+    }
+
+    const data = await resp.json();
+
+    if (data.status !== "ok") {
+      throw new Error(`FlareSolverr error: ${data.message || "unknown"}`);
+    }
+
+    const solution = data.solution;
+    const html = solution.response;
+    const statusCode = solution.status;
+
+    // Check if the response is still a CF challenge page
+    if (html && (html.includes("Just a moment") || html.includes("Checking your browser") || html.includes("challenge-platform"))) {
+      // FlareSolverr might need more time — retry with longer timeout
+      throw new Error("CF challenge not solved within timeout — try increasing maxTimeout");
+    }
+
+    fsLastSuccess = Date.now();
+    fsLastError = null;
+    return { html, statusCode, url: solution.url, cookies: solution.cookies || [] };
+  } catch (err) {
+    fsLastError = err.message;
+    throw err;
   } finally {
     paheThrottle.release();
+  }
+}
+
+/**
+ * Destroy and recreate the FlareSolverr session (useful after errors)
+ */
+async function flaresolverrReset() {
+  try {
+    await fetch(FLARESOLVERR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd: "session.destroy", session: PAHE_SESSION }),
+      signal: AbortSignal.timeout(10000),
+    });
+  } catch (e) {}
+  fsSessionCreated = false;
+}
+
+/**
+ * Check if FlareSolverr is reachable
+ */
+async function flaresolverrHealth() {
+  try {
+    const resp = await fetch(FLARESOLVERR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd: "request.get", url: "https://httpbin.org/get", maxTimeout: 10000 }),
+      signal: AbortSignal.timeout(15000),
+    });
+    return resp.ok;
+  } catch (e) {
+    return false;
   }
 }
 
@@ -249,8 +211,16 @@ async function paheSearch(query) {
   if (c) return c;
 
   try {
-    const resp = await paheFetch(`${PAHE_BASE}/api?m=search&q=${encodeURIComponent(query)}`);
-    const data = JSON.parse(resp.body);
+    const { html } = await flaresolverrGet(`${PAHE_BASE}/api?m=search&q=${encodeURIComponent(query)}`);
+
+    // Parse JSON from the HTML response
+    let data;
+    try {
+      data = JSON.parse(html);
+    } catch (e) {
+      throw new Error(`Invalid JSON from animepahe search: ${html.substring(0, 200)}`);
+    }
+
     const results = (data.data || []).map(a => ({
       id: a.id,
       title: a.title,
@@ -259,8 +229,9 @@ async function paheSearch(query) {
       status: a.status,
       year: a.year,
       season: a.season,
-      session: a.session, // needed for episode fetching
+      session: a.session,
     }));
+
     setCache(ck, results);
     return results;
   } catch (err) {
@@ -276,50 +247,45 @@ async function paheEpisodes(animeSession) {
   if (c) return c;
 
   try {
-    // First, get the anime page to find the internal temp_id
-    const pageResp = await paheFetch(`${PAHE_BASE}/anime/${animeSession}`, { accept: "text/html, */*" });
-    const pageHtml = pageResp.body;
+    // Step 1: Get anime page to find internal ID
+    const { html: pageHtml } = await flaresolverrGet(`${PAHE_BASE}/anime/${animeSession}`);
 
     // Extract temp_id from og:url meta tag
     let tempId = null;
     const ogUrlMatch = pageHtml.match(/<meta\s+property="og:url"\s+content="[^"]*\/([^"]+)"/i);
-    if (ogUrlMatch) {
-      tempId = ogUrlMatch[1];
-    }
+    if (ogUrlMatch) tempId = ogUrlMatch[1];
 
-    // Fallback: try to extract from the page HTML
+    // Fallback: try extracting from page
     if (!tempId) {
       const idMatch = pageHtml.match(/"id"\s*:\s*(\d+)/);
       if (idMatch) tempId = idMatch[1];
     }
+    if (!tempId) tempId = animeSession;
 
-    if (!tempId) {
-      // Try the anime session as the ID
-      tempId = animeSession;
-    }
-
-    // Fetch episodes from the release API (paginated)
+    // Step 2: Fetch episodes from release API (paginated)
     const allEpisodes = [];
     let page = 1;
     let lastPage = 1;
 
     do {
-      const resp = await paheFetch(`${PAHE_BASE}/api?m=release&id=${tempId}&sort=episode_asc&page=${page}`);
-      const data = JSON.parse(resp.body);
-      const episodes = data.data || [];
+      const { html: epHtml } = await flaresolverrGet(`${PAHE_BASE}/api?m=release&id=${tempId}&sort=episode_asc&page=${page}`);
 
+      let data;
+      try { data = JSON.parse(epHtml); } catch (e) { throw new Error(`Invalid JSON from episodes API: ${epHtml.substring(0, 200)}`); }
+
+      const episodes = data.data || [];
       for (const ep of episodes) {
         allEpisodes.push({
           number: ep.episode,
           title: `Episode ${ep.episode}`,
-          session: ep.session, // needed for source fetching
+          session: ep.session,
           snapshot: ep.snapshot || null,
         });
       }
 
       lastPage = data.last_page || 1;
       page++;
-    } while (page <= lastPage && page <= 20); // safety limit
+    } while (page <= lastPage && page <= 20);
 
     setCache(ck, allEpisodes);
     return allEpisodes;
@@ -336,13 +302,13 @@ async function paheSources(animeSession, episodeSession) {
   if (c) return c;
 
   try {
-    // Step 1: Fetch the play page
-    const playResp = await paheFetch(`${PAHE_BASE}/play/${animeSession}/${episodeSession}`, { accept: "text/html, */*" });
-    const playHtml = playResp.body;
+    // Step 1: Fetch the play page through FlareSolverr
+    const { html: playHtml } = await flaresolverrGet(`${PAHE_BASE}/play/${animeSession}/${episodeSession}`);
 
     // Step 2: Extract Kwik links from the play page
-    // Look for data-src attributes on buttons
     const kwikLinks = [];
+
+    // Look for buttons with data-src
     const buttonRegex = /<button[^>]*data-src="([^"]+)"[^>]*(?:data-fansub="([^"]*)")?[^>]*(?:data-resolution="([^"]*)")?[^>]*(?:data-audio="([^"]*)")?/gi;
     let match;
     while ((match = buttonRegex.exec(playHtml)) !== null) {
@@ -354,7 +320,13 @@ async function paheSources(animeSession, episodeSession) {
       });
     }
 
-    // Fallback: regex for any kwik.cx/si/link URLs
+    // Fallback: look for <a> with data-src
+    const linkRegex = /<a[^>]*data-src="([^"]+)"[^>]*(?:data-fansub="([^"]*)")?[^>]*(?:data-resolution="([^"]*)")?/gi;
+    while ((match = linkRegex.exec(playHtml)) !== null) {
+      kwikLinks.push({ url: match[1], fansub: match[2] || "unknown", resolution: match[3] || "auto", audio: "jpn" });
+    }
+
+    // Fallback: regex for kwik.cx/si URLs
     if (kwikLinks.length === 0) {
       const kwikRegex = /https?:\/\/kwik\.(si|cx|link)\/e\/[^\s"'<>]+/gi;
       while ((match = kwikRegex.exec(playHtml)) !== null) {
@@ -376,7 +348,7 @@ async function paheSources(animeSession, episodeSession) {
             url: m3u8,
             type: "m3u8",
             quality: kwik.resolution || "auto",
-            server: `pahe-kwik`,
+            server: "pahe-kwik",
             fansub: kwik.fansub,
             audio: kwik.audio,
             headers: {
@@ -402,28 +374,15 @@ async function paheSources(animeSession, episodeSession) {
   }
 }
 
-// ─── Kwik m3u8 Resolution (VM Sandbox) ────────────────────────────────────────
+// ─── Kwik m3u8 Resolution (FlareSolverr + VM Sandbox) ────────────────────────
 async function resolveKwikM3U8(kwikUrl) {
   const ck = `kwik-m3u8:${kwikUrl}`;
   const c = getCached(ck);
   if (c) return c;
 
   try {
-    // Fetch the Kwik embed page with proper Referer
-    const { cookieHeader, userAgent } = await paheGetCookies();
-    const resp = await gotScraping({
-      url: kwikUrl,
-      headers: {
-        "User-Agent": userAgent,
-        "Cookie": cookieHeader,
-        "Referer": PAHE_BASE + "/",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-      followRedirect: true,
-      timeout: { request: 15000 },
-    });
-
-    const html = resp.body;
+    // Fetch Kwik page through FlareSolverr (CF protected)
+    const { html } = await flaresolverrGet(kwikUrl);
 
     // Quick check: is m3u8 directly in the HTML?
     const directM3u8 = html.match(/https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*/i);
@@ -449,7 +408,7 @@ async function resolveKwikM3U8(kwikUrl) {
     // Try each script in VM sandbox with mocked Plyr/Hls
     for (const script of scripts) {
       try {
-        const m3u8 = await executeKwikScript(script, kwikUrl);
+        const m3u8 = executeKwikScript(script, kwikUrl);
         if (m3u8) {
           setCache(ck, m3u8);
           return m3u8;
@@ -459,7 +418,7 @@ async function resolveKwikM3U8(kwikUrl) {
       }
     }
 
-    // Fallback: regex search entire HTML for uwucdn/stream patterns
+    // Fallback: regex search for uwucdn/stream patterns
     const streamMatch = html.match(/https?:\/\/[^"'<>\s]+\/stream\/[^"'<>\s]+\.m3u8[^"'<>\s]*/i);
     if (streamMatch) {
       setCache(ck, streamMatch[0]);
@@ -473,155 +432,96 @@ async function resolveKwikM3U8(kwikUrl) {
   }
 }
 
-// ─── VM Sandbox Execution for Kwik Scripts ────────────────────────────────────
+// ─── VM Sandbox Execution for Kwik Scripts (synchronous) ──────────────────────
 function executeKwikScript(scriptContent, pageUrl) {
-  return new Promise((resolve, reject) => {
-    const captured = new Set();
-    let resolved = false;
+  const captured = new Set();
 
-    const finish = (val) => {
-      if (resolved) return;
-      resolved = true;
-      resolve(val);
-    };
-
-    // Timeout safety
-    const timer = setTimeout(() => finish(null), 3000);
-
-    try {
-      // Mock Plyr constructor — captures m3u8 from opts.sources
-      const Plyr = function (el, opts) {
-        try {
-          if (opts && Array.isArray(opts.sources)) {
-            for (const s of opts.sources) {
-              if (s && typeof s.src === "string" && s.src.includes(".m3u8")) {
-                captured.add(s.src);
-              }
+  try {
+    // Mock Plyr constructor — captures m3u8 from opts.sources
+    const Plyr = function (el, opts) {
+      try {
+        if (opts && Array.isArray(opts.sources)) {
+          for (const s of opts.sources) {
+            if (s && typeof s.src === "string" && s.src.includes(".m3u8")) {
+              captured.add(s.src);
             }
           }
-        } catch (e) {}
-        return { on: () => ({}), destroy: () => {} };
-      };
-      Plyr.isSupported = () => true;
-
-      // Mock Hls constructor — captures m3u8 from loadSource()
-      const Hls = function (cfg) {
-        const hlsObj = {
-          loadSource: (src) => {
-            try {
-              if (typeof src === "string" && src.includes(".m3u8")) {
-                captured.add(src);
-              }
-            } catch (e) {}
-          },
-          attachMedia: () => {},
-          on: () => {},
-          startLoad: () => {},
-          destroy: () => {},
-        };
-        return hlsObj;
-      };
-      Hls.isSupported = () => true;
-      Hls.Events = { MANIFEST_PARSED: "manifestParsed", ERROR: "error" };
-
-      // Mock DOM element
-      const mockVideo = { src: "", textContent: "", innerHTML: "", appendChild: () => {}, removeChild: () => {}, addEventListener: () => {}, removeEventListener: () => {}, setAttribute: () => {}, getAttribute: () => null, style: {}, classList: { add: () => {}, remove: () => {}, contains: () => false } };
-      const mockDoc = { getElementById: () => mockVideo, querySelector: () => mockVideo, querySelectorAll: () => [], getElementsByTagName: () => [], getElementsByClassName: () => [], createElement: () => ({...mockVideo, setAttribute: () => {}, classList: { add: () => {}, remove: () => {} } }), body: mockVideo, head: mockVideo, addEventListener: () => {}, removeEventListener: () => {}, cookie: "", referrer: PAHE_BASE + "/", domain: new URL(PAHE_BASE).hostname, title: "" };
-      const mockWin = { document: mockDoc, location: { href: pageUrl, origin: new URL(pageUrl).origin, hostname: new URL(pageUrl).hostname, protocol: "https:", assign: () => {}, replace: () => {}, reload: () => {} }, navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", plugins: [1, 2, 3], languages: ["en-US", "en"], webdriver: false }, self: null, top: null, parent: null, frames: [], localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, addEventListener: () => {}, removeEventListener: () => {}, atob: (s) => Buffer.from(s, "base64").toString("binary"), btoa: (s) => Buffer.from(s, "binary").toString("base64"), fetch: async () => ({ ok: true, text: async () => "", json: async () => ({}) }), XMLHttpRequest: function () { this.open = this.send = this.setRequestHeader = this.getResponseHeader = this.getAllResponseHeaders = () => {}; }, Image: function () { this.src = ""; }, MutationObserver: class { observe() {} disconnect() {} }, };
-      mockWin.self = mockWin;
-      mockWin.top = mockWin;
-      mockWin.parent = mockWin;
-
-      const sandbox = {
-        ...mockWin,
-        window: mockWin,
-        document: mockDoc,
-        Plyr,
-        Hls,
-        console: { log: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
-        setTimeout: (fn, ms) => { try { if (typeof fn === "function") return setTimeout(fn, Math.min(ms || 0, 1000)); return setTimeout(fn, ms); } catch (e) { return -1; } },
-        clearTimeout: (id) => clearTimeout(id),
-        setInterval: (fn, ms) => -1,
-        clearInterval: () => {},
-        requestAnimationFrame: (fn) => -1,
-        cancelAnimationFrame: () => {},
-        Math,
-        Date,
-        JSON,
-        Array,
-        Object,
-        String,
-        Number,
-        Boolean,
-        RegExp,
-        Error,
-        TypeError,
-        RangeError,
-        parseInt,
-        parseFloat,
-        isNaN,
-        isFinite,
-        encodeURIComponent,
-        decodeURIComponent,
-        encodeURI,
-        decodeURI,
-        undefined,
-        NaN,
-        Infinity,
-      };
-
-      const ctx = createContext(sandbox);
-
-      // Run the script
-      try {
-        new Script(scriptContent).runInContext(ctx, { timeout: 2000 });
-      } catch (e) {
-        // Script may throw but we may have captured the m3u8 already
-      }
-
-      // Also try evaluating eval() bodies directly
-      const evalMatches = [...scriptContent.matchAll(/eval\(([\s\S]*?)\)\s*;?/gi)];
-      for (const em of evalMatches) {
-        try {
-          if (em[1] && em[1].length > 10) {
-            new Script(em[1]).runInContext(ctx, { timeout: 1500 });
-          }
-        } catch (e) {}
-      }
-
-      // Check captured m3u8 URLs
-      if (captured.size > 0) {
-        clearTimeout(timer);
-        const m3u8 = Array.from(captured)[0];
-        finish(m3u8);
-        return;
-      }
-
-      // Check video.src
-      if (mockVideo.src && mockVideo.src.includes(".m3u8")) {
-        clearTimeout(timer);
-        finish(mockVideo.src);
-        return;
-      }
-
-      // Deep search: stringify sandbox and look for m3u8
-      try {
-        const str = JSON.stringify(sandbox);
-        const deepMatch = str.match(/https?:\/\/[^"\\]+\.m3u8[^"\\]*/i);
-        if (deepMatch) {
-          clearTimeout(timer);
-          finish(deepMatch[0]);
-          return;
         }
       } catch (e) {}
+      return { on: () => ({}), destroy: () => {} };
+    };
+    Plyr.isSupported = () => true;
 
-      clearTimeout(timer);
-      finish(null);
-    } catch (err) {
-      clearTimeout(timer);
-      finish(null);
+    // Mock Hls constructor — captures m3u8 from loadSource()
+    const Hls = function (cfg) {
+      return {
+        loadSource: (src) => {
+          try { if (typeof src === "string" && src.includes(".m3u8")) captured.add(src); } catch (e) {}
+        },
+        attachMedia: () => {},
+        on: () => {},
+        startLoad: () => {},
+        destroy: () => {},
+      };
+    };
+    Hls.isSupported = () => true;
+    Hls.Events = { MANIFEST_PARSED: "manifestParsed", ERROR: "error" };
+
+    // Mock DOM
+    const mockVideo = { src: "", textContent: "", innerHTML: "", appendChild: () => {}, removeChild: () => {}, addEventListener: () => {}, removeEventListener: () => {}, setAttribute: () => {}, getAttribute: () => null, style: {}, classList: { add: () => {}, remove: () => {}, contains: () => false } };
+    const mockDoc = { getElementById: () => mockVideo, querySelector: () => mockVideo, querySelectorAll: () => [], getElementsByTagName: () => [], getElementsByClassName: () => [], createElement: () => ({...mockVideo, setAttribute: () => {}, classList: { add: () => {}, remove: () => {} } }), body: mockVideo, head: mockVideo, addEventListener: () => {}, removeEventListener: () => {}, cookie: "", referrer: PAHE_BASE + "/", domain: new URL(PAHE_BASE).hostname, title: "" };
+    const mockWin = { document: mockDoc, location: { href: pageUrl, origin: new URL(pageUrl).origin, hostname: new URL(pageUrl).hostname, protocol: "https:", assign: () => {}, replace: () => {}, reload: () => {} }, navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", plugins: [1, 2, 3], languages: ["en-US", "en"], webdriver: false }, self: null, top: null, parent: null, frames: [], localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, addEventListener: () => {}, removeEventListener: () => {}, atob: (s) => Buffer.from(s, "base64").toString("binary"), btoa: (s) => Buffer.from(s, "binary").toString("base64"), fetch: async () => ({ ok: true, text: async () => "", json: async () => ({}) }), XMLHttpRequest: function () { this.open = this.send = this.setRequestHeader = this.getResponseHeader = this.getAllResponseHeaders = () => {}; }, Image: function () { this.src = ""; }, MutationObserver: class { observe() {} disconnect() {} }, };
+    mockWin.self = mockWin;
+    mockWin.top = mockWin;
+    mockWin.parent = mockWin;
+
+    const sandbox = {
+      ...mockWin,
+      window: mockWin,
+      document: mockDoc,
+      Plyr,
+      Hls,
+      console: { log: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
+      setTimeout: (fn, ms) => { try { if (typeof fn === "function") return setTimeout(fn, Math.min(ms || 0, 1000)); return setTimeout(fn, ms); } catch (e) { return -1; } },
+      clearTimeout: (id) => clearTimeout(id),
+      setInterval: () => -1,
+      clearInterval: () => {},
+      requestAnimationFrame: () => -1,
+      cancelAnimationFrame: () => {},
+      Math, Date, JSON, Array, Object, String, Number, Boolean, RegExp, Error, TypeError, RangeError,
+      parseInt, parseFloat, isNaN, isFinite,
+      encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
+      undefined, NaN, Infinity,
+    };
+
+    const ctx = createContext(sandbox);
+
+    // Run the script
+    try { new Script(scriptContent).runInContext(ctx, { timeout: 2000 }); } catch (e) {}
+
+    // Also try evaluating eval() bodies directly
+    const evalMatches = [...scriptContent.matchAll(/eval\(([\s\S]*?)\)\s*;?/gi)];
+    for (const em of evalMatches) {
+      try { if (em[1] && em[1].length > 10) new Script(em[1]).runInContext(ctx, { timeout: 1500 }); } catch (e) {}
     }
-  });
+
+    // Check captured m3u8 URLs
+    if (captured.size > 0) return Array.from(captured)[0];
+
+    // Check video.src
+    if (mockVideo.src && mockVideo.src.includes(".m3u8")) return mockVideo.src;
+
+    // Deep search: stringify sandbox
+    try {
+      const str = JSON.stringify(sandbox);
+      const deepMatch = str.match(/https?:\/\/[^"\\]+\.m3u8[^"\\]*/i);
+      if (deepMatch) return deepMatch[0];
+    } catch (e) {}
+
+    return null;
+  } catch (err) {
+    return null;
+  }
 }
 
 // ─── AniList ID → AnimePahe mapping ───────────────────────────────────────────
@@ -631,7 +531,6 @@ async function anilistToPahe(alId) {
   if (c) return c;
 
   try {
-    // Get anime title from AniList
     const resp = await fetch(ANILIST_API, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -644,13 +543,11 @@ async function anilistToPahe(alId) {
     const media = data.data?.Media;
     if (!media) return null;
 
-    // Try each title variant to search on animepahe
     const titles = [media.title?.romaji, media.title?.english, media.title?.native, ...(media.synonyms || [])].filter(Boolean);
 
     for (const title of titles) {
       const results = await paheSearch(title);
       if (results.length > 0) {
-        // Find best match (exact or closest)
         const exact = results.find(r => r.title.toLowerCase() === title.toLowerCase());
         const result = exact || results[0];
         setCache(ck, result);
@@ -691,7 +588,6 @@ async function hlsProxy(req, res) {
     const ct = resp.headers.get("content-type") || "";
     const body = await resp.text();
 
-    // If m3u8 playlist, rewrite URLs to go through our proxy
     if (targetUrl.includes(".m3u8") || ct.includes("mpegurl") || ct.includes("octet-stream")) {
       const base = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
       const proxyBase = `${req.protocol}://${req.get("host")}/hls-proxy`;
@@ -700,14 +596,12 @@ async function hlsProxy(req, res) {
         .split("\n")
         .map(line => {
           if (line.startsWith("#")) {
-            // Rewrite URI= in EXT-X-MAP or EXT-X-KEY
             return line.replace(/URI="([^"]+)"/g, (_, uri) => {
               const full = uri.startsWith("http") ? uri : base + uri;
               return `URI="${proxyBase}?url=${encodeURIComponent(full)}&referer=${encodeURIComponent(referer)}"`;
             });
           }
           if (!line.trim()) return line;
-          // Rewrite segment URLs
           const full = line.startsWith("http") ? line : base + line;
           return `${proxyBase}?url=${encodeURIComponent(full)}&referer=${encodeURIComponent(referer)}`;
         })
@@ -717,7 +611,6 @@ async function hlsProxy(req, res) {
       return res.send(rewritten);
     }
 
-    // Otherwise pass through (ts segments, etc.)
     const buf = Buffer.from(body, "binary");
     res.set("Content-Type", ct || "video/mp2t");
     res.set("Content-Length", buf.length);
@@ -736,7 +629,15 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "4.0.0", providers: ["animex", "pahe"], paheCfBypass: "FlareSolverr + got-scraping fallback", paheCookies: paheCookies ? `fresh (${Math.round((Date.now() - paheCookies.timestamp) / 60000)}m ago, cf_clearance: ${paheCookies.cookieHeader.includes("cf_clearance")})` : "none", flaresolverr: FLARESOLVERR_URL }));
+app.get("/health", async (_req, res) => {
+  const fsOk = await flaresolverrHealth().catch(() => false);
+  res.json({
+    status: "ok",
+    version: "4.1.0",
+    providers: ["animex", "pahe"],
+    flaresolverr: { url: FLARESOLVERR_URL, reachable: fsOk, session: PAHE_SESSION, lastSuccess: fsLastSuccess ? `${Math.round((Date.now() - fsLastSuccess) / 1000)}s ago` : "never", lastError: fsLastError },
+  });
+});
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -748,14 +649,26 @@ app.get("/animex/episodes/:slug", async (req, res) => { try { res.json(await axE
 app.get("/animex/sources/:slug/:ep", async (req, res) => { try { res.json(await axSources(req.params.slug, req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
 
 // ─── PAHE ROUTES ──────────────────────────────────────────────────────────────
-app.get("/pahe/search", async (req, res) => { try { res.json(await paheSearch(req.query.q)); } catch (e) { res.status(502).json({ error: `Pahe search: ${e.message}` }); } });
-app.get("/pahe/episodes/:session", async (req, res) => { try { res.json(await paheEpisodes(req.params.session)); } catch (e) { res.status(502).json({ error: `Pahe episodes: ${e.message}` }); } });
-app.get("/pahe/sources/:animeSession/:episodeSession", async (req, res) => { try { res.json(await paheSources(req.params.animeSession, req.params.episodeSession)); } catch (e) { res.status(502).json({ error: `Pahe sources: ${e.message}` }); } });
+app.get("/pahe/search", async (req, res) => { try { res.json(await paheSearch(req.query.q)); } catch (e) { res.status(502).json({ error: `Pahe: ${e.message}` }); } });
+app.get("/pahe/episodes/:session", async (req, res) => { try { res.json(await paheEpisodes(req.params.session)); } catch (e) { res.status(502).json({ error: `Pahe: ${e.message}` }); } });
+app.get("/pahe/sources/:animeSession/:episodeSession", async (req, res) => { try { res.json(await paheSources(req.params.animeSession, req.params.episodeSession)); } catch (e) { res.status(502).json({ error: `Pahe: ${e.message}` }); } });
 app.get("/pahe/anilist/:id", async (req, res) => { try { const r = await anilistToPahe(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found on animepahe" }); } catch (e) { res.status(502).json({ error: e.message }); } });
 
-// ─── PAHE COOKIE MANAGEMENT ───────────────────────────────────────────────────
-app.get("/pahe/cookies", async (_req, res) => { try { await paheGetCookies(); res.json({ status: "ok", age: paheCookies ? `${Math.round((Date.now() - paheCookies.timestamp) / 60000)} minutes` : "none", hasCfClearance: paheCookies?.cookieHeader?.includes("cf_clearance") || false }); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.post("/pahe/cookies/refresh", async (_req, res) => { try { await paheRefreshCookies(); res.json({ status: "ok", message: "Cookies refreshed" }); } catch (e) { res.status(502).json({ error: e.message }); } });
+// ─── PAHE FLARESOLVERR MANAGEMENT ─────────────────────────────────────────────
+app.get("/pahe/status", async (_req, res) => {
+  const fsOk = await flaresolverrHealth().catch(() => false);
+  res.json({
+    flaresolverr: { url: FLARESOLVERR_URL, reachable: fsOk },
+    session: PAHE_SESSION,
+    lastSuccess: fsLastSuccess ? new Date(fsLastSuccess).toISOString() : null,
+    lastError: fsLastError,
+  });
+});
+
+app.post("/pahe/session/reset", async (_req, res) => {
+  await flaresolverrReset();
+  res.json({ status: "ok", message: "FlareSolverr session reset" });
+});
 
 // ─── UNIFIED ROUTES (try both providers) ──────────────────────────────────────
 app.get("/search", async (req, res) => {
@@ -772,7 +685,6 @@ app.get("/anilist/:id/stream", async (req, res) => {
   const ep = req.query.ep || 1;
   const result = { animex: null, pahe: null };
 
-  // Try animex
   try {
     const mapping = await axAnilistToSlug(id);
     if (mapping) {
@@ -780,7 +692,6 @@ app.get("/anilist/:id/stream", async (req, res) => {
     }
   } catch (e) { result.animex = { error: e.message }; }
 
-  // Try pahe
   try {
     const mapping = await anilistToPahe(id);
     if (mapping) {
@@ -795,10 +706,9 @@ app.get("/anilist/:id/stream", async (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v4.0 on :${PORT}`);
+  console.log(`LuffyTV API v4.1 on :${PORT}`);
   console.log(`  Animex: ${AX_GQL} + ${AX_REST.join(", ")}`);
-  console.log(`  Pahe:   ${PAHE_BASE} (FlareSolverr: ${FLARESOLVERR_URL})`);
-
-  // Proactively warm up pahe cookies on startup
-  paheRefreshCookies().then(() => console.log("[Pahe] Startup cookie warmup OK")).catch(e => console.warn(`[Pahe] Startup cookie warmup failed: ${e.message}`));
+  console.log(`  Pahe:   ${PAHE_BASE} via FlareSolverr (${FLARESOLVERR_URL})`);
+  console.log(`  ⚠️  FlareSolverr MUST be running for animepahe to work!`);
+  console.log(`  Start with: docker-compose up -d`);
 });
