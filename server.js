@@ -1,27 +1,19 @@
 /**
- * LuffyTV Miruro API — Combined Server v4.1
+ * LuffyTV Miruro API — Combined Server v5.0
  *
  * TWO providers running in parallel:
  *   - /animex/*  — animex.one (pp.animex.one + chad.anidap.lol fallback, 429 retry)
- *   - /pahe/*    — animepahe.pw (FlareSolverr CF UAM bypass, Kwik m3u8/HLS)
+ *   - /mkissa/*  — mkissa.to (encrypted API, multi-embed extractor, m3u8/mp4)
  *
  * Unified routes (/search, /anilist/:id/stream) try BOTH providers.
- *
- * CRITICAL: FlareSolverr makes ALL animepahe requests through its Chromium instance.
- * cf_clearance cookies are tied to the TLS fingerprint, so we can't transfer them
- * to got-scraping/axios. FlareSolverr's real Chrome handles both CF challenge AND
- * the TLS fingerprint match. Sessions are persisted for speed.
  */
 
 import express from "express";
 import cors from "cors";
-import { createContext, Script } from "vm";
-import { gotScraping } from "got-scraping";
+import crypto from "node:crypto";
 
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);
-const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || "http://localhost:8191/v1";
-const PAHE_SESSION = "animepahe"; // FlareSolverr session name for persistence
 
 // ─── Shared Cache ──────────────────────────────────────────────────────────────
 const cache = new Map();
@@ -99,525 +91,403 @@ async function axSources(slug, ep) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  ANIMEPAHE PROVIDER  —  FlareSolverr for ALL requests
+//  MKISSA PROVIDER  —  mkissa.to encrypted API + multi-embed extractors
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const PAHE_BASE = process.env.ANIMEPAHE_BASE || "https://animepahe.pw";
-const ANILIST_API = "https://graphql.anilist.co";
-const paheThrottle = new Throttler(2);
+const MK_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+const MK_REFERER = "https://mkissa.to";
+const MK_API = "https://api.mkissa.net";
+const MK_API_URL = `${MK_API}/api`;
+const MK_CDN_ROOT = "https://cdn.mkissa.net/all/mk";
+const MK_DISCOVERY_PATH = "/anime/attack-on-titan-Ycid9tDZd2FxGCJ8o/sub/1";
+const ANIZIP = "https://api.ani.zip/mappings";
+const MK_CONTENT_LANE = "k7";
+const MK_REFERER_HOST = "mkissa.to";
+const MK_KEY_GROUP = "mkissa";
+const MK_BOOT_EPOCH_MS = 604800000;
+const MK_BOOT_GRACE_MS = 86400000;
+const MK_AA_REQ_MS = 300000;
+const MK_WATCH_TTL = 3 * 60 * 60 * 1000;
+const MK_EPISODE_QUERY_HASH = "b0a4efecd8df8fce709468d54aaa716b712c93b5b7e351888ddc242898abc38e";
+const MK_DISCOVERY_CONCURRENCY = 16;
+const MK_DISCOVERY_LIMIT = 600;
+const MK_FETCH_TIMEOUT = 10000;
+const MK_EXTRACT_TIMEOUT = 5000;
 
-// ─── FlareSolverr Session Manager ─────────────────────────────────────────────
-let fsSessionCreated = false;
-let fsLastError = null;
-let fsLastSuccess = 0;
+const HEX_TABLE = { "79":"A","7a":"B","7b":"C","7c":"D","7d":"E","7e":"F","7f":"G","70":"H","71":"I","72":"J","73":"K","74":"L","75":"M","76":"N","77":"O","68":"P","69":"Q","6a":"R","6b":"S","6c":"T","6d":"U","6e":"V","6f":"W","60":"X","61":"Y","62":"Z","59":"a","5a":"b","5b":"c","5c":"d","5d":"e","5e":"f","5f":"g","50":"h","51":"i","52":"j","53":"k","54":"l","55":"m","56":"n","57":"o","48":"p","49":"q","4a":"r","4b":"s","4c":"t","4d":"u","4e":"v","4f":"w","40":"x","41":"y","42":"z","08":"0","09":"1","0a":"2","0b":"3","0c":"4","0d":"5","0e":"6","0f":"7","00":"8","01":"9","15":"-","16":".","67":"_","46":"~","02":":","17":"/","07":"?","1b":"#","63":"[","65":"]","78":"@","19":"!","1c":"$","1e":"&","10":"(","11":")","12":"*","13":"+","14":",","03":";","05":"=","1d":"%" };
 
-/**
- * Make a request through FlareSolverr's Chromium instance.
- * This is the ONLY way to bypass Cloudflare UAM — the real browser handles
- * both the JS challenge AND the TLS fingerprint that cf_clearance is tied to.
- *
- * FlareSolverr uses persistent sessions so the browser stays open between requests.
- */
-async function flaresolverrGet(url, maxTimeout = 30000) {
-  await paheThrottle.acquire();
-  try {
-    const body = {
-      cmd: "request.get",
-      url,
-      maxTimeout,
-      session: PAHE_SESSION, // Persist browser session for speed
-    };
+let mkCryptoConfigCache = null;
+let mkBootstrapCache = null;
+const mkSessionCookies = new Map();
+const mkWatchCache = new Map();
 
-    // Only create session on first request
-    if (!fsSessionCreated) {
-      body.session = PAHE_SESSION;
-      fsSessionCreated = true;
+function mkDecodeHexUrl(hex) { let out = ""; for (let i = 0; i < hex.length; i += 2) { out += HEX_TABLE[hex.substring(i, i + 2).toLowerCase()] ?? hex.substring(i, i + 2); } return out; }
+function mkSha256Hex(v) { return crypto.createHash("sha256").update(v).digest("hex"); }
+function mkHmacBytes(k, v) { return crypto.createHmac("sha256", k).update(v).digest(); }
+function mkSleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function mkStoreCookies(headers) {
+  const raw = typeof headers.getSetCookie === "function" ? headers.getSetCookie() : [headers.get("set-cookie")].filter(Boolean);
+  for (const value of raw) { for (const part of String(value).split(/,(?=[^;,]+=)/)) { const pair = part.split(";")[0]?.trim(); const idx = pair?.indexOf("="); if (idx > 0) mkSessionCookies.set(pair.slice(0, idx), pair.slice(idx + 1)); } }
+}
+
+function mkCookieHeader() { return [...mkSessionCookies].map(([k, v]) => `${k}=${v}`).join("; "); }
+
+function mkBrowserHeaders(extra = {}) {
+  const c = mkCookieHeader();
+  return { "User-Agent": MK_UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "sec-ch-ua": '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"', "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"', ...(c ? { Cookie: c } : {}), ...extra };
+}
+
+async function mkSessionFetch(url, opts = {}) {
+  const res = await fetch(url, { ...opts, headers: mkBrowserHeaders(opts.headers || {}) });
+  mkStoreCookies(res.headers);
+  return res;
+}
+
+async function mkFetchText(url, extra = {}) {
+  const ac = new AbortController(); const timer = setTimeout(() => ac.abort(), MK_FETCH_TIMEOUT);
+  try { const res = await mkSessionFetch(url, { signal: ac.signal, headers: { Referer: `${MK_REFERER}/`, ...extra } }); if (!res.ok) throw new Error(`Fetch ${res.status}: ${url}`); return res.text(); } finally { clearTimeout(timer); }
+}
+
+async function mkFetchWithTimeout(url, opts = {}, timeout = MK_EXTRACT_TIMEOUT) {
+  const ac = new AbortController(); const timer = setTimeout(() => ac.abort(), timeout);
+  try { const res = await fetch(url, { ...opts, signal: opts.signal || ac.signal }); mkStoreCookies(res.headers); return res; } finally { clearTimeout(timer); }
+}
+
+// ─── Crypto Config Discovery ──────────────────────────────────────────────────
+function mkNormalizeCryptoConfig(out) { if (!out?.buildId || !Array.isArray(out.maskParts) || out.maskParts.length < 4) return null; return { buildId: String(out.buildId), maskParts: out.maskParts.slice(0, 4).map(String) }; }
+
+function mkEvalOldCryptoChunk(chunk) {
+  const cs = chunk.search(/const\s+[A-Za-z_$][\w$]*\s*=[^;]{0,180}\?"\d+":"",\s*[A-Za-z_$][\w$]*=\[/);
+  if (cs < 0) return null;
+  const tm = [...chunk.slice(0, cs).matchAll(/function\s+([A-Za-z_$][\w$]*)\s*\(\)\{const e=\[/g)];
+  const ts = tm.at(-1)?.index ?? -1;
+  const as = chunk.indexOf("async function", cs);
+  if (ts < 0 || as < 0) return null;
+  let code = chunk.slice(ts, as);
+  const bm = code.match(/const\s+([A-Za-z_$][\w$]*)\s*=([^;]+?\?"(\d+)":"")\s*,\s*([A-Za-z_$][\w$]*)=\[/);
+  if (!bm) return null;
+  const bn = bm[1], mn = bm[4];
+  code = code.replace(new RegExp(`\\b[A-Za-z_$][\\w$]*\\(\\);\\s*const\\s+${bn}=`), `const ${bn}=`);
+  code = code.replace(new RegExp(`const\\s+${bn}=`), `var ${bn}=`);
+  code = code.replace(new RegExp(`,\\s*${mn}=\\[`), `;var ${mn}=[`);
+  code += `\nreturn { buildId: ${bn}, maskParts: ${mn} };`;
+  return mkNormalizeCryptoConfig(Function(code)());
+}
+
+function mkEvalModernCryptoChunk(chunk) {
+  const cs = chunk.search(/const\s+[A-Za-z_$][\w$]*\s*=[^;]{0,220}\?"\d+":"",\s*[A-Za-z_$][\w$]*=\[/);
+  if (cs < 0) return null;
+  const wm = [...chunk.slice(0, cs).matchAll(/const\s+[A-Za-z_$][\w$]*=\(function\(\)\{/g)].at(-1);
+  const ws = wm?.index ?? -1;
+  const tm2 = [...chunk.slice(0, ws).matchAll(/function\s+[A-Za-z_$][\w$]*\s*\(\)\{const\s+[A-Za-z_$][\w$]*=\[/g)].at(-1);
+  const ts = tm2?.index ?? -1;
+  const dm = [...chunk.slice(0, ts).matchAll(/function\s+[A-Za-z_$][\w$]*\s*\([A-Za-z_$][\w$]*(?:,[A-Za-z_$][\w$]*)?\)\{return\s+[A-Za-z_$][\w$]*=[A-Za-z_$][\w$]*-\d+,[A-Za-z_$][\w$]*\(\)\[[A-Za-z_$][\w$]*\]\}/g)].at(-1);
+  const ti = dm?.index ?? -1;
+  const as = chunk.indexOf("async function", cs);
+  if (ti < 0 || ws < 0 || as < 0) return null;
+  const head = chunk.slice(ti, ws);
+  let body = chunk.slice(cs, as);
+  const bMatch = body.match(/const\s+([A-Za-z_$][\w$]*)=/);
+  const mMatch = body.match(/,([A-Za-z_$][\w$]*)=\[/);
+  const mfMatch = body.match(/function\s+([A-Za-z_$][\w$]*)\s*\([^)]*=\s*([A-Za-z_$][\w$]*)\)/);
+  if (!bMatch || !mMatch || !mfMatch) return null;
+  const bn = bMatch[1], mn = mMatch[1], mfn = mfMatch[1];
+  body = body.replace(new RegExp(`const\\s+${bn}=`), `var ${bn}=`);
+  body = body.replace(new RegExp(`,${mn}=\\[`), `;var ${mn}=[`);
+  body += `\nreturn { buildId: ${bn}, maskParts: ${mn}, mask: Array.from(${mfn}(${bn}) || []) };`;
+  return mkNormalizeCryptoConfig(Function(head + body)());
+}
+
+function mkEvalCryptoChunk(chunk) { try { return mkEvalModernCryptoChunk(chunk); } catch {} try { return mkEvalOldCryptoChunk(chunk); } catch {} return null; }
+
+async function mkDiscoverCryptoConfig(force = false) {
+  if (!force && mkCryptoConfigCache?.expiresAt && Date.now() < mkCryptoConfigCache.expiresAt) return mkCryptoConfigCache;
+  const html = await mkFetchText(`${MK_REFERER}${MK_DISCOVERY_PATH}`, { Accept: "text/html,*/*" });
+  const appUrl = html.match(/import\("([^"]+\/_app\/immutable\/entry\/app\.[^"]+\.js)"\)/)?.[1] || html.match(/src="([^"]+\/_app\/immutable\/entry\/app\.[^"]+\.js)"/)?.[1];
+  if (!appUrl) throw new Error("MKissa app entry not found");
+  const app = await mkFetchText(appUrl, { Accept: "application/javascript,*/*" });
+  const queue = [appUrl]; const seen = new Set();
+  while (queue.length && seen.size < MK_DISCOVERY_LIMIT) {
+    const batch = queue.splice(0, MK_DISCOVERY_CONCURRENCY).filter(u => { if (seen.has(u)) return false; seen.add(u); return true; });
+    const chunks = await Promise.all(batch.map(async u => { try { return { url: u, text: u === appUrl ? app : await mkFetchText(u, { Accept: "application/javascript,*/*" }) }; } catch { return null; } }));
+    for (const item of chunks.filter(Boolean)) {
+      const imported = [...item.text.matchAll(/(?:import\(|from\s*)["']([^"']+\.js)["']/g), ...item.text.matchAll(/"(\.\.\/(?:chunks|nodes)\/[^"\n]+\.js)"/g)].map(m => m[1]).filter(v => v.startsWith(".") || v.startsWith("/"));
+      for (const v of imported) { const next = new URL(v, item.url).toString(); if (!seen.has(next)) queue.push(next); }
+      if (!/client-crypto|x-aa-boot|aaReq|partB/.test(item.text)) continue;
+      const config = mkEvalCryptoChunk(item.text);
+      const valid = config ? await mkIsValidCryptoConfig(config).catch(e => e?.name === "AbortError" ? null : false) : false;
+      if (config && valid !== false) { mkCryptoConfigCache = { ...config, expiresAt: Date.now() + 1800000 }; return mkCryptoConfigCache; }
     }
-
-    const resp = await fetch(FLARESOLVERR_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(maxTimeout + 15000),
-    });
-
-    if (!resp.ok) {
-      throw new Error(`FlareSolverr HTTP ${resp.status}: ${await resp.text().catch(() => "")}`);
-    }
-
-    const data = await resp.json();
-
-    if (data.status !== "ok") {
-      throw new Error(`FlareSolverr error: ${data.message || "unknown"}`);
-    }
-
-    const solution = data.solution;
-    const html = solution.response;
-    const statusCode = solution.status;
-
-    // Check if the response is still a CF challenge page
-    if (html && (html.includes("Just a moment") || html.includes("Checking your browser") || html.includes("challenge-platform"))) {
-      // FlareSolverr might need more time — retry with longer timeout
-      throw new Error("CF challenge not solved within timeout — try increasing maxTimeout");
-    }
-
-    fsLastSuccess = Date.now();
-    fsLastError = null;
-    return { html, statusCode, url: solution.url, cookies: solution.cookies || [] };
-  } catch (err) {
-    fsLastError = err.message;
-    throw err;
-  } finally {
-    paheThrottle.release();
   }
+  throw new Error("MKissa crypto chunk not found");
 }
 
-/**
- * Destroy and recreate the FlareSolverr session (useful after errors)
- */
-async function flaresolverrReset() {
-  try {
-    await fetch(FLARESOLVERR_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cmd: "session.destroy", session: PAHE_SESSION }),
-      signal: AbortSignal.timeout(10000),
-    });
-  } catch (e) {}
-  fsSessionCreated = false;
+function mkBuildMaskSeed(buildId) { const n = String(buildId || ""); const out = Buffer.alloc(32); for (let i = 0; i < 32; i++) out[i] = (n.charCodeAt(i % n.length) || 0) ^ ((i * 17 + 31) & 255); return out; }
+
+function mkBuildMask(buildId, maskParts) {
+  const seed = mkBuildMaskSeed(buildId); const out = Buffer.alloc(32);
+  for (let i = 0; i < maskParts.length; i++) { const part = Buffer.from(maskParts[i], "base64"); const off = i * 8; for (let j = 0; j < 8; j++) out[off + j] = (part[j] ^ seed[off + j]) ^ ((i * 41 + j * 7) & 255); }
+  return out;
 }
 
-/**
- * Check if FlareSolverr is reachable
- */
-async function flaresolverrHealth() {
-  try {
-    const resp = await fetch(FLARESOLVERR_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cmd: "request.get", url: "https://httpbin.org/get", maxTimeout: 10000 }),
-      signal: AbortSignal.timeout(15000),
-    });
-    return resp.ok;
-  } catch (e) {
-    return false;
+function mkCurrentEpoches(now = Date.now()) { const epoch = Math.floor(now / MK_BOOT_EPOCH_MS); const pg = now - epoch * MK_BOOT_EPOCH_MS < MK_BOOT_GRACE_MS && epoch > 0 ? epoch - 1 : epoch; return [...new Set([pg, epoch])]; }
+
+function mkMakeBootToken(config, epoch, lane = MK_CONTENT_LANE) {
+  const mask = mkBuildMask(config.buildId, config.maskParts);
+  const bootKey = mkHmacBytes(mask, `aa-boot:${config.buildId}`);
+  return mkHmacBytes(bootKey, `${config.buildId}:${MK_KEY_GROUP}:${MK_REFERER_HOST}:${epoch}:${lane}`).toString("hex");
+}
+
+async function mkIsValidCryptoConfig(config, lane = MK_CONTENT_LANE) {
+  for (const epoch of mkCurrentEpoches()) {
+    const ac = new AbortController(); const timer = setTimeout(() => ac.abort(), MK_FETCH_TIMEOUT);
+    try { const res = await mkSessionFetch(`${MK_API}/client-crypto/v1/bootstrap?buildId=${encodeURIComponent(config.buildId)}&k=${encodeURIComponent(lane)}`, { signal: ac.signal, headers: { Referer: `${MK_REFERER}/`, Origin: MK_REFERER, "x-build-id": config.buildId, "x-aa-boot": mkMakeBootToken(config, epoch, lane) } }); if (res.ok) return true; } finally { clearTimeout(timer); }
   }
+  return false;
 }
 
-// ─── Pahe Search ──────────────────────────────────────────────────────────────
-async function paheSearch(query) {
-  const ck = `pahe-search:${query}`;
-  const c = getCached(ck);
-  if (c) return c;
-
-  try {
-    const { html } = await flaresolverrGet(`${PAHE_BASE}/api?m=search&q=${encodeURIComponent(query)}`);
-
-    // Parse JSON from the HTML response
-    let data;
-    try {
-      data = JSON.parse(html);
-    } catch (e) {
-      throw new Error(`Invalid JSON from animepahe search: ${html.substring(0, 200)}`);
-    }
-
-    const results = (data.data || []).map(a => ({
-      id: a.id,
-      title: a.title,
-      image: a.poster,
-      type: a.type,
-      status: a.status,
-      year: a.year,
-      season: a.season,
-      session: a.session,
-    }));
-
-    setCache(ck, results);
-    return results;
-  } catch (err) {
-    console.error(`Pahe search error: ${err.message}`);
-    throw err;
+async function mkFetchBootstrap(lane = MK_CONTENT_LANE, force = false) {
+  const config = await mkDiscoverCryptoConfig(force);
+  if (!force && mkBootstrapCache?.lane === lane && mkBootstrapCache.buildId === config.buildId && mkBootstrapCache.switchAt && Date.now() < mkBootstrapCache.switchAt) return mkBootstrapCache;
+  let lastErr = null;
+  for (const epoch of mkCurrentEpoches()) {
+    const res = await mkSessionFetch(`${MK_API}/client-crypto/v1/bootstrap?buildId=${encodeURIComponent(config.buildId)}&k=${encodeURIComponent(lane)}`, { headers: { Referer: `${MK_REFERER}/`, Origin: MK_REFERER, "x-build-id": config.buildId, "x-aa-boot": mkMakeBootToken(config, epoch, lane) } });
+    const raw = await res.text(); if (!res.ok) { lastErr = new Error(`Bootstrap ${res.status}: ${raw.slice(0, 180)}`); continue; }
+    const data = JSON.parse(raw); if (!data?.partB) { lastErr = new Error("Bootstrap missing partB"); continue; }
+    mkBootstrapCache = { ...data, lane, buildId: config.buildId, maskParts: config.maskParts }; return mkBootstrapCache;
   }
+  throw lastErr || new Error("MKissa bootstrap failed");
 }
 
-// ─── Pahe Episodes ────────────────────────────────────────────────────────────
-async function paheEpisodes(animeSession) {
-  const ck = `pahe-episodes:${animeSession}`;
-  const c = getCached(ck);
-  if (c) return c;
+function mkDeriveLaneKey(partB, config) { const enc = Buffer.from(partB, "base64"); const mask = mkBuildMask(config.buildId, config.maskParts); const key = Buffer.alloc(32); for (let i = 0; i < 32; i++) key[i] = enc[i] ^ mask[i % mask.length]; return key; }
 
-  try {
-    // Step 1: Get anime page to find internal ID
-    const { html: pageHtml } = await flaresolverrGet(`${PAHE_BASE}/anime/${animeSession}`);
+async function mkGetLaneKey(lane = MK_CONTENT_LANE, force = false) { const boot = await mkFetchBootstrap(lane, force); return { key: mkDeriveLaneKey(boot.partB, boot), epoch: boot.epoch, buildId: boot.buildId }; }
 
-    // Extract temp_id from og:url meta tag
-    let tempId = null;
-    const ogUrlMatch = pageHtml.match(/<meta\s+property="og:url"\s+content="[^"]*\/([^"]+)"/i);
-    if (ogUrlMatch) tempId = ogUrlMatch[1];
+function mkMakeAaReq(key, epoch, buildId, queryHash, lane = MK_CONTENT_LANE) {
+  const ts = Math.floor(Date.now() / MK_AA_REQ_MS) * MK_AA_REQ_MS;
+  const payload = Buffer.from(JSON.stringify({ v: 1, ts, epoch, buildId, qh: queryHash, k: lane }));
+  const iv = crypto.createHash("sha256").update(`${epoch}:${buildId}:${queryHash}:${ts}:${lane}`).digest().subarray(0, 12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const body = Buffer.concat([cipher.update(payload), cipher.final(), cipher.getAuthTag()]);
+  return Buffer.concat([Buffer.from([1]), iv, body]).toString("base64");
+}
 
-    // Fallback: try extracting from page
-    if (!tempId) {
-      const idMatch = pageHtml.match(/"id"\s*:\s*(\d+)/);
-      if (idMatch) tempId = idMatch[1];
-    }
-    if (!tempId) tempId = animeSession;
+function mkDecryptTobeparsed(b64, key) {
+  const buf = Buffer.from(b64, "base64"); if (buf[0] !== 1) throw new Error(`Unsupported MKissa encryption version: ${buf[0]}`);
+  const iv = buf.subarray(1, 13); const body = buf.subarray(13); const ct = body.subarray(0, body.length - 16); const tag = body.subarray(body.length - 16);
+  const dec = crypto.createDecipheriv("aes-256-gcm", key, iv); dec.setAuthTag(tag);
+  return JSON.parse(Buffer.concat([dec.update(ct), dec.final()]).toString("utf8"));
+}
 
-    // Step 2: Fetch episodes from release API (paginated)
-    const allEpisodes = [];
-    let page = 1;
-    let lastPage = 1;
+// ─── Episode Query ────────────────────────────────────────────────────────────
+function mkEpisodeQuery() {
+  const zt = `tbObj { u sm md ts }`;
+  const pu = `_id name englishName nativeName slugTime`;
+  const xa = `${pu} thumbnail ${zt} lastEpisodeInfo lastEpisodeDate type season score airedStart availableEpisodes episodeDuration episodeCount lastUpdateEnd characterCount`;
+  return `query($showId:String! $translationType:VaildTranslationTypeEnumType! $episodeString:String!) { episode(showId:$showId translationType:$translationType episodeString:$episodeString) { episodeString uploadDate sourceUrls thumbnail notes show { ${xa} description broadcastInterval banner characters availableEpisodesDetail nameOnlyString isAdult relatedShows relatedMangas altNames } } }`;
+}
 
-    do {
-      const { html: epHtml } = await flaresolverrGet(`${PAHE_BASE}/api?m=release&id=${tempId}&sort=episode_asc&page=${page}`);
+// ─── API Calls ────────────────────────────────────────────────────────────────
+async function mkApiPost(query, variables, opts = {}) {
+  const config = opts.buildId ? opts : await mkDiscoverCryptoConfig();
+  const body = opts.extensions ? { query, variables, extensions: opts.extensions } : { query, variables };
+  const res = await mkSessionFetch(MK_API_URL, { method: "POST", headers: { Referer: `${MK_REFERER}/`, Origin: MK_REFERER, "Content-Type": "application/json", "x-build-id": config.buildId, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-site" }, body: JSON.stringify(body) });
+  const raw = await res.text(); if (!res.ok) throw new Error(`API POST ${res.status}: ${raw.slice(0, 200)}`);
+  const json = JSON.parse(raw); if (json.errors?.length) { const msgs = json.errors.map(e => e.message || e.extensions?.code || "GraphQL error"); const err = new Error(msgs.join(" · ")); if (msgs.includes("NEED_CAPTCHA")) err.code = "NEED_CAPTCHA"; throw err; }
+  return json.data;
+}
 
-      let data;
-      try { data = JSON.parse(epHtml); } catch (e) { throw new Error(`Invalid JSON from episodes API: ${epHtml.substring(0, 200)}`); }
-
-      const episodes = data.data || [];
-      for (const ep of episodes) {
-        allEpisodes.push({
-          number: ep.episode,
-          title: `Episode ${ep.episode}`,
-          session: ep.session,
-          snapshot: ep.snapshot || null,
-        });
-      }
-
-      lastPage = data.last_page || 1;
-      page++;
-    } while (page <= lastPage && page <= 20);
-
-    setCache(ck, allEpisodes);
-    return allEpisodes;
-  } catch (err) {
-    console.error(`Pahe episodes error: ${err.message}`);
-    throw err;
+async function mkApiEpisode(query, variables, opts = {}) {
+  const { force = false, hashIndex = 0, captchaRetry = 0, postFallback = false } = opts;
+  const hashes = [...new Set([MK_EPISODE_QUERY_HASH, mkSha256Hex(query)].filter(Boolean))];
+  const hash = hashes[Math.min(hashIndex, hashes.length - 1)];
+  const { key, epoch, buildId } = await mkGetLaneKey(MK_CONTENT_LANE, force);
+  const extensions = { persistedQuery: { version: 1, sha256Hash: hash }, k: MK_CONTENT_LANE, aaReq: mkMakeAaReq(key, epoch, buildId, hash, MK_CONTENT_LANE) };
+  const url = `${MK_API_URL}?variables=${encodeURIComponent(JSON.stringify(variables))}&extensions=${encodeURIComponent(JSON.stringify(extensions))}`;
+  const res = await mkSessionFetch(url, { headers: { Referer: `${MK_REFERER}/`, Origin: MK_REFERER, "x-build-id": buildId, "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-site" } });
+  const raw = await res.text(); if (!res.ok) throw new Error(`API ${res.status}: ${raw.slice(0, 200)}`);
+  const json = JSON.parse(raw);
+  const msgs = json.errors?.map(e => e.message || e.extensions?.code).filter(Boolean) || [];
+  if (msgs.includes("PersistedQueryNotFound") || msgs.some(m => /Context creation failed/i.test(m))) {
+    if (hashIndex + 1 < hashes.length) return mkApiEpisode(query, variables, { force: true, hashIndex: hashIndex + 1 });
+    const posted = await mkApiPost(query, variables, { buildId, extensions });
+    return posted?.tobeparsed ? mkDecryptTobeparsed(posted.tobeparsed, key) : posted;
   }
-}
-
-// ─── Pahe Sources (Kwik → m3u8) ──────────────────────────────────────────────
-async function paheSources(animeSession, episodeSession) {
-  const ck = `pahe-sources:${animeSession}:${episodeSession}`;
-  const c = getCached(ck);
-  if (c) return c;
-
-  try {
-    // Step 1: Fetch the play page through FlareSolverr
-    const { html: playHtml } = await flaresolverrGet(`${PAHE_BASE}/play/${animeSession}/${episodeSession}`);
-
-    // Step 2: Extract Kwik links from the play page
-    const kwikLinks = [];
-
-    // Look for buttons with data-src
-    const buttonRegex = /<button[^>]*data-src="([^"]+)"[^>]*(?:data-fansub="([^"]*)")?[^>]*(?:data-resolution="([^"]*)")?[^>]*(?:data-audio="([^"]*)")?/gi;
-    let match;
-    while ((match = buttonRegex.exec(playHtml)) !== null) {
-      kwikLinks.push({
-        url: match[1],
-        fansub: match[2] || "unknown",
-        resolution: match[3] || "auto",
-        audio: match[4] || "jpn",
-      });
-    }
-
-    // Fallback: look for <a> with data-src
-    const linkRegex = /<a[^>]*data-src="([^"]+)"[^>]*(?:data-fansub="([^"]*)")?[^>]*(?:data-resolution="([^"]*)")?/gi;
-    while ((match = linkRegex.exec(playHtml)) !== null) {
-      kwikLinks.push({ url: match[1], fansub: match[2] || "unknown", resolution: match[3] || "auto", audio: "jpn" });
-    }
-
-    // Fallback: regex for kwik.cx/si URLs
-    if (kwikLinks.length === 0) {
-      const kwikRegex = /https?:\/\/kwik\.(si|cx|link)\/e\/[^\s"'<>]+/gi;
-      while ((match = kwikRegex.exec(playHtml)) !== null) {
-        kwikLinks.push({ url: match[0], fansub: "unknown", resolution: "auto", audio: "jpn" });
-      }
-    }
-
-    if (kwikLinks.length === 0) {
-      throw new Error("No Kwik links found on play page");
-    }
-
-    // Step 3: Resolve each Kwik link to m3u8
-    const sources = [];
-    for (const kwik of kwikLinks) {
+  if (msgs.includes("NEED_CAPTCHA")) {
+    if (!postFallback) {
       try {
-        const m3u8 = await resolveKwikM3U8(kwik.url);
-        if (m3u8) {
-          sources.push({
-            url: m3u8,
-            type: "m3u8",
-            quality: kwik.resolution || "auto",
-            server: "pahe-kwik",
-            fansub: kwik.fansub,
-            audio: kwik.audio,
-            headers: {
-              Referer: kwik.url,
-              Origin: new URL(kwik.url).origin,
-            },
-          });
-        }
-      } catch (err) {
-        console.warn(`[Pahe] Kwik resolve failed for ${kwik.url}: ${err.message}`);
-      }
+        const postHash = mkSha256Hex(query);
+        const postExt = { persistedQuery: { version: 1, sha256Hash: postHash }, k: MK_CONTENT_LANE, aaReq: mkMakeAaReq(key, epoch, buildId, postHash, MK_CONTENT_LANE) };
+        const posted = await mkApiPost(query, variables, { buildId, extensions: postExt });
+        return posted?.tobeparsed ? mkDecryptTobeparsed(posted.tobeparsed, key) : posted;
+      } catch (err) { if (err.code !== "NEED_CAPTCHA") throw err; }
     }
-
-    if (sources.length === 0) {
-      throw new Error("No m3u8 sources resolved from Kwik");
+    if (captchaRetry < 5) {
+      console.warn(`[MKissa] CAPTCHA retry ${captchaRetry + 1}/5`);
+      await mkSleep(1500 + captchaRetry * 1200);
+      return mkApiEpisode(query, variables, { force: true, captchaRetry: captchaRetry + 1, hashIndex, postFallback: true });
     }
-
-    setCache(ck, sources);
-    return sources;
-  } catch (err) {
-    console.error(`Pahe sources error: ${err.message}`);
-    throw err;
+    const err = new Error("MKissa requested captcha — try again later or use captcha endpoint"); err.code = "NEED_CAPTCHA"; throw err;
   }
+  if (msgs.some(m => /^AA_CRYPTO_/.test(m))) {
+    if (!force) return mkApiEpisode(query, variables, { force: true, captchaRetry, hashIndex, postFallback });
+    throw new Error(msgs.join(" · "));
+  }
+  if (json.data?.tobeparsed) return mkDecryptTobeparsed(json.data.tobeparsed, key);
+  if (msgs.length) throw new Error(msgs.join(" · "));
+  return json.data;
 }
 
-// ─── Kwik m3u8 Resolution (FlareSolverr + VM Sandbox) ────────────────────────
-async function resolveKwikM3U8(kwikUrl) {
-  const ck = `kwik-m3u8:${kwikUrl}`;
-  const c = getCached(ck);
-  if (c) return c;
-
-  try {
-    // Fetch Kwik page through FlareSolverr (CF protected)
-    const { html } = await flaresolverrGet(kwikUrl);
-
-    // Quick check: is m3u8 directly in the HTML?
-    const directM3u8 = html.match(/https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*/i);
-    if (directM3u8) {
-      setCache(ck, directM3u8[0]);
-      return directM3u8[0];
-    }
-
-    // Extract all <script> blocks
-    const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
-    const scripts = [];
-    let scriptMatch;
-    while ((scriptMatch = scriptRegex.exec(html)) !== null) {
-      if (scriptMatch[1] && scriptMatch[1].trim().length > 20) {
-        scripts.push(scriptMatch[1]);
-      }
-    }
-
-    if (scripts.length === 0) {
-      throw new Error("No scripts found on Kwik page");
-    }
-
-    // Try each script in VM sandbox with mocked Plyr/Hls
-    for (const script of scripts) {
-      try {
-        const m3u8 = executeKwikScript(script, kwikUrl);
-        if (m3u8) {
-          setCache(ck, m3u8);
-          return m3u8;
-        }
-      } catch (err) {
-        // Try next script
-      }
-    }
-
-    // Fallback: regex search for uwucdn/stream patterns
-    const streamMatch = html.match(/https?:\/\/[^"'<>\s]+\/stream\/[^"'<>\s]+\.m3u8[^"'<>\s]*/i);
-    if (streamMatch) {
-      setCache(ck, streamMatch[0]);
-      return streamMatch[0];
-    }
-
-    throw new Error("Could not extract m3u8 from Kwik page");
-  } catch (err) {
-    console.error(`Kwik resolve error for ${kwikUrl}: ${err.message}`);
-    throw err;
-  }
+// ─── Search & Resolve ─────────────────────────────────────────────────────────
+async function mkSearch(query, mode = "sub") {
+  const gql = `query($search:SearchInput $limit:Int $page:Int $translationType:VaildTranslationTypeEnumType $countryOrigin:VaildCountryOriginEnumType){shows(search:$search limit:$limit page:$page translationType:$translationType countryOrigin:$countryOrigin){edges{_id name englishName nativeName slugTime availableEpisodes availableEpisodesDetail aniListId __typename}}}`;
+  const data = await mkApiPost(gql, { search: { allowAdult: false, allowUnknown: false, query }, limit: 40, page: 1, translationType: mode, countryOrigin: "ALL" });
+  return data?.shows?.edges ?? [];
 }
 
-// ─── VM Sandbox Execution for Kwik Scripts (synchronous) ──────────────────────
-function executeKwikScript(scriptContent, pageUrl) {
-  const captured = new Set();
-
-  try {
-    // Mock Plyr constructor — captures m3u8 from opts.sources
-    const Plyr = function (el, opts) {
-      try {
-        if (opts && Array.isArray(opts.sources)) {
-          for (const s of opts.sources) {
-            if (s && typeof s.src === "string" && s.src.includes(".m3u8")) {
-              captured.add(s.src);
-            }
-          }
-        }
-      } catch (e) {}
-      return { on: () => ({}), destroy: () => {} };
-    };
-    Plyr.isSupported = () => true;
-
-    // Mock Hls constructor — captures m3u8 from loadSource()
-    const Hls = function (cfg) {
-      return {
-        loadSource: (src) => {
-          try { if (typeof src === "string" && src.includes(".m3u8")) captured.add(src); } catch (e) {}
-        },
-        attachMedia: () => {},
-        on: () => {},
-        startLoad: () => {},
-        destroy: () => {},
-      };
-    };
-    Hls.isSupported = () => true;
-    Hls.Events = { MANIFEST_PARSED: "manifestParsed", ERROR: "error" };
-
-    // Mock DOM
-    const mockVideo = { src: "", textContent: "", innerHTML: "", appendChild: () => {}, removeChild: () => {}, addEventListener: () => {}, removeEventListener: () => {}, setAttribute: () => {}, getAttribute: () => null, style: {}, classList: { add: () => {}, remove: () => {}, contains: () => false } };
-    const mockDoc = { getElementById: () => mockVideo, querySelector: () => mockVideo, querySelectorAll: () => [], getElementsByTagName: () => [], getElementsByClassName: () => [], createElement: () => ({...mockVideo, setAttribute: () => {}, classList: { add: () => {}, remove: () => {} } }), body: mockVideo, head: mockVideo, addEventListener: () => {}, removeEventListener: () => {}, cookie: "", referrer: PAHE_BASE + "/", domain: new URL(PAHE_BASE).hostname, title: "" };
-    const mockWin = { document: mockDoc, location: { href: pageUrl, origin: new URL(pageUrl).origin, hostname: new URL(pageUrl).hostname, protocol: "https:", assign: () => {}, replace: () => {}, reload: () => {} }, navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", plugins: [1, 2, 3], languages: ["en-US", "en"], webdriver: false }, self: null, top: null, parent: null, frames: [], localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, addEventListener: () => {}, removeEventListener: () => {}, atob: (s) => Buffer.from(s, "base64").toString("binary"), btoa: (s) => Buffer.from(s, "binary").toString("base64"), fetch: async () => ({ ok: true, text: async () => "", json: async () => ({}) }), XMLHttpRequest: function () { this.open = this.send = this.setRequestHeader = this.getResponseHeader = this.getAllResponseHeaders = () => {}; }, Image: function () { this.src = ""; }, MutationObserver: class { observe() {} disconnect() {} }, };
-    mockWin.self = mockWin;
-    mockWin.top = mockWin;
-    mockWin.parent = mockWin;
-
-    const sandbox = {
-      ...mockWin,
-      window: mockWin,
-      document: mockDoc,
-      Plyr,
-      Hls,
-      console: { log: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
-      setTimeout: (fn, ms) => { try { if (typeof fn === "function") return setTimeout(fn, Math.min(ms || 0, 1000)); return setTimeout(fn, ms); } catch (e) { return -1; } },
-      clearTimeout: (id) => clearTimeout(id),
-      setInterval: () => -1,
-      clearInterval: () => {},
-      requestAnimationFrame: () => -1,
-      cancelAnimationFrame: () => {},
-      Math, Date, JSON, Array, Object, String, Number, Boolean, RegExp, Error, TypeError, RangeError,
-      parseInt, parseFloat, isNaN, isFinite,
-      encodeURIComponent, decodeURIComponent, encodeURI, decodeURI,
-      undefined, NaN, Infinity,
-    };
-
-    const ctx = createContext(sandbox);
-
-    // Run the script
-    try { new Script(scriptContent).runInContext(ctx, { timeout: 2000 }); } catch (e) {}
-
-    // Also try evaluating eval() bodies directly
-    const evalMatches = [...scriptContent.matchAll(/eval\(([\s\S]*?)\)\s*;?/gi)];
-    for (const em of evalMatches) {
-      try { if (em[1] && em[1].length > 10) new Script(em[1]).runInContext(ctx, { timeout: 1500 }); } catch (e) {}
-    }
-
-    // Check captured m3u8 URLs
-    if (captured.size > 0) return Array.from(captured)[0];
-
-    // Check video.src
-    if (mockVideo.src && mockVideo.src.includes(".m3u8")) return mockVideo.src;
-
-    // Deep search: stringify sandbox
-    try {
-      const str = JSON.stringify(sandbox);
-      const deepMatch = str.match(/https?:\/\/[^"\\]+\.m3u8[^"\\]*/i);
-      if (deepMatch) return deepMatch[0];
-    } catch (e) {}
-
-    return null;
-  } catch (err) {
-    return null;
-  }
+async function mkGetEpisodeSources(showId, epNum, audio = "sub") {
+  const data = await mkApiEpisode(mkEpisodeQuery(), { showId, translationType: audio, episodeString: String(epNum) });
+  return data?.episode ?? null;
 }
 
-// ─── AniList ID → AnimePahe mapping ───────────────────────────────────────────
-async function anilistToPahe(alId) {
-  const ck = `al2pahe:${alId}`;
-  const c = getCached(ck);
-  if (c) return c;
+function mkSlugifyTitle(v) { return String(v || "").normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""); }
 
-  try {
-    const resp = await fetch(ANILIST_API, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        query: `query($id:Int!){Media(id:$id,type:ANIME){id title{romaji english native}synonyms}}`,
-        variables: { id: alId },
-      }),
-    });
-    const data = await resp.json();
-    const media = data.data?.Media;
-    if (!media) return null;
+async function mkWarmWatchPage(showId, show, epNum, audio) {
+  const slug = show?.slugTime || mkSlugifyTitle(show?.englishName || show?.name || show?.nativeName);
+  if (!slug || !showId) return;
+  try { await mkFetchWithTimeout(`${MK_REFERER}/anime/${slug}-${showId}/${audio}/${epNum}`, { headers: mkBrowserHeaders({ Accept: "text/html,*/*", Referer: `${MK_REFERER}/`, "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate" }) }, MK_FETCH_TIMEOUT); } catch {}
+}
 
-    const titles = [media.title?.romaji, media.title?.english, media.title?.native, ...(media.synonyms || [])].filter(Boolean);
+async function mkFetchAniZip(anilistId) { try { const res = await fetch(`${ANIZIP}?anilist_id=${anilistId}`); if (!res.ok) return null; return res.json(); } catch { return null; } }
 
-    for (const title of titles) {
-      const results = await paheSearch(title);
-      if (results.length > 0) {
-        const exact = results.find(r => r.title.toLowerCase() === title.toLowerCase());
-        const result = exact || results[0];
-        setCache(ck, result);
-        return result;
-      }
-    }
+function mkNormalize(s) { return (s || "").toLowerCase().replace(/[^\p{L}\p{N}]/gu, ""); }
+function mkExtractYear(t) { if (!t) return null; const m = t.match(/\b(19\d{2}|20\d{2})\b/); return m ? parseInt(m[1]) : null; }
 
-    return null;
-  } catch (err) {
-    console.error(`AniList→Pahe mapping error: ${err.message}`);
-    return null;
+function mkFindBestMatch(results, titles, targetYear, targetId) {
+  const nTitles = titles.map(mkNormalize).filter(Boolean);
+  let best = null, maxScore = -Infinity;
+  for (const r of results) {
+    if (targetId && r.aniListId && String(r.aniListId) === String(targetId)) return r;
+    const names = [r.name, r.englishName, r.nativeName].map(mkNormalize).filter(Boolean);
+    let nameScore = 0, isExact = false;
+    for (const n of names) { if (nTitles.includes(n)) { nameScore = 100; isExact = true; break; } }
+    if (!isExact) { let maxF = 0; for (const rn of names) for (const t of nTitles) { if (t.includes(rn) || rn.includes(t)) { maxF = Math.max(maxF, Math.min(rn.length, t.length) - Math.abs(rn.length - t.length) * 0.1); } } nameScore = maxF; }
+    let yearScore = 0; const rYear = mkExtractYear(r.name) || mkExtractYear(r.englishName); if (targetYear && rYear) yearScore = rYear === targetYear ? 50 : -200;
+    const total = nameScore + yearScore; if (total > maxScore) { maxScore = total; best = r; }
   }
+  return best || results[0];
+}
+
+async function mkFetchAniListMedia(anilistId) {
+  try { const q = "query($id:Int){Media(id:$id,type:ANIME){seasonYear startDate{year}title{romaji english native}}}"; const res = await fetch("https://graphql.anilist.co", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ query: q, variables: { id: Number(anilistId) } }) }); if (!res.ok) return null; return (await res.json()).data?.Media ?? null; } catch { return null; }
+}
+
+async function mkResolveMkissaId(anilistId) {
+  const [anizipRes, alMedia] = await Promise.all([mkFetchAniZip(anilistId).catch(() => ({})), mkFetchAniListMedia(anilistId).catch(() => null)]);
+  const anizip = anizipRes || {};
+  let titlesToTry = [];
+  if (anizip.titles) titlesToTry = [anizip.titles.en, anizip.titles.ja, anizip.titles["x-jat"], ...Object.values(anizip.titles)].filter(Boolean);
+  if (alMedia?.title) { const alT = [alMedia.title.english, alMedia.title.romaji, alMedia.title.native].filter(Boolean); titlesToTry = [...new Set([...alT, ...titlesToTry])]; }
+  if (!titlesToTry.length && anizip.mappings) { const apId = anizip.mappings.animeplanet_id; if (apId) titlesToTry = [apId.split(/[-_]/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(" ")]; }
+  if (!titlesToTry.length) throw new Error(`Could not resolve titles for AniList ID: ${anilistId}`);
+  const targetYear = alMedia?.seasonYear || alMedia?.startDate?.year || null;
+  let allResults = [];
+  for (const title of titlesToTry.slice(0, 3)) allResults.push(...await mkSearch(title, "sub"));
+  const seen = new Set(); allResults = allResults.filter(r => { if (seen.has(r._id)) return false; seen.add(r._id); return true; });
+  if (!allResults.length) throw new Error(`No MKissa match for "${titlesToTry[0]}"`);
+  const match = mkFindBestMatch(allResults, titlesToTry, targetYear, anilistId);
+  return { showId: match._id, show: match, anizip };
+}
+
+// ─── Embed Extractors ─────────────────────────────────────────────────────────
+function mkHexToBytes(hex) { const c = hex.replace(/[^0-9a-f]/gi, ""); const out = new Uint8Array(c.length / 2); for (let i = 0; i < out.length; i++) out[i] = parseInt(c.slice(i * 2, i * 2 + 2), 16); return out; }
+
+async function mkAesDecrypt(hex) { const d = crypto.createDecipheriv("aes-128-cbc", Buffer.from("kiemtienmua911ca"), Buffer.from("1234567890oiuytr")); return Buffer.concat([d.update(Buffer.from(mkHexToBytes(hex))), d.final()]).toString("utf8"); }
+
+async function mkExtractMp4(id) { try { const r = await mkFetchWithTimeout(`https://www.mp4upload.com/embed-${id}.html`, { headers: { "User-Agent": MK_UA, Referer: "https://mp4upload.com/" } }); if (!r.ok) return null; const h = await r.text(); const m = h.match(/player\.src\s*\(\s*\{[^}]*\bsrc\s*:\s*"([^"]+)"/) || h.match(/"file"\s*:\s*"(https?:[^"]+\.mp4[^"]*)"/) || h.match(/\bsrc\s*:\s*"(https?:[^"]+\.mp4[^"]*)"/); return m?.[1]?.replace(/\\/g, "") || null; } catch { return null; } }
+
+async function mkExtractUns(url) { try { const parsed = new URL(url); const id = parsed.hash.replace(/^#/, "").split("&")[0]; if (!id) return null; const base = `${parsed.protocol}//${parsed.host}`; const r = await mkFetchWithTimeout(`${base}/api/v1/video?id=${encodeURIComponent(id)}&w=1280&h=720&r=`, { headers: { "User-Agent": MK_UA, Referer: `${base}/#${id}`, Origin: base } }); if (!r.ok) return null; const hex = (await r.text()).trim(); if (!hex || !/^[0-9a-f]+$/i.test(hex)) return null; const data = JSON.parse(await mkAesDecrypt(hex)); return data?.source || data?.cf || null; } catch { return null; } }
+
+async function mkExtractOk(id) { try { const r = await mkFetchWithTimeout(`https://ok.ru/videoembed/${id}`, { headers: { "User-Agent": MK_UA, Referer: "https://ok.ru/" } }); if (!r.ok) return null; const h = await r.text(); const m = h.match(/ondemandHls\\&quot;:\\&quot;(https?:\/\/.*?)\\&quot;/); return m?.[1]?.replace(/\\u0026/g, "&") || null; } catch { return null; } }
+
+async function mkExtractStreamSB(id) { try { const bh = { "User-Agent": MK_UA, Referer: `${MK_REFERER}/`, watchsb: "streamsb", Accept: "application/json,*/*" }; const r1 = await mkFetchWithTimeout(`https://streamsb.net/api/v1/video?id=${id}`, { headers: bh }); const sid = (r1.headers.get("set-cookie") || "").match(/sid=([^;]+)/)?.[1] ?? ""; const html = await r1.text(); const m = html.match(/window\.location\.replace\('([^']+)'\)/); if (!m) return null; const r2 = await mkFetchWithTimeout(m[1], { headers: { ...bh, Cookie: `sid=${sid}`, Referer: `https://streamsb.net/e/${id}.html` } }); if (!r2.ok) return null; const ct = r2.headers.get("content-type") ?? ""; if (!ct.includes("json")) return null; const data = await r2.json(); return data?.stream_data?.file ?? data?.data?.file ?? null; } catch { return null; } }
+
+async function mkExtractStreamlare(id) { try { const r = await mkFetchWithTimeout("https://streamlare.com/api/video/stream/get", { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": MK_UA, Referer: "https://streamlare.com/", Origin: "https://streamlare.com" }, body: JSON.stringify({ id }) }); if (!r.ok) return null; const data = await r.json(); return data?.data?.file ?? null; } catch { return null; } }
+
+async function mkExtractClock(url) { try { const clockUrl = url.replace("/clock", "/clock.json"); const r = await mkFetchWithTimeout(clockUrl, { headers: { "User-Agent": MK_UA, Referer: "https://allanime.day/player.html" } }); if (!r.ok) return null; const data = await r.json(); const links = Array.isArray(data?.links) ? data.links : []; const best = links.find(i => i?.hls && i?.link) || links.find(i => i?.link); return best?.link || null; } catch { return null; } }
+
+function mkEmbedMediaType(url) { if (!url) return null; if (url.includes(".m3u8")) return "hls"; if (url.includes(".mp4")) return "mp4"; return "direct"; }
+
+async function mkExtractSource(src) {
+  let url = src.sourceUrl;
+  if (url && url.startsWith("--")) url = mkDecodeHexUrl(url.slice(2));
+  if (url && url.startsWith("/apivtwo/clock")) url = "https://allanime.day" + url.replace("/clock", "/clock.json");
+  if (url && /^https?:\/\/allanime\.day\/apivtwo\/clock(?:\.json)?/i.test(url)) url = url.replace("/clock?", "/clock.json?");
+  let extractedUrl = null;
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, "");
+    if (host === "allanime.day" && /\/apivtwo\/clock(?:\.json)?/i.test(new URL(url).pathname)) extractedUrl = await mkExtractClock(url);
+    else if (src.type === "player") extractedUrl = url;
+    else if (host === "mp4upload.com") { const m = url.match(/embed-([a-zA-Z0-9]+)\.html/i); if (m?.[1]) extractedUrl = await mkExtractMp4(m[1]); }
+    else if (/uns\.bio$/i.test(host)) extractedUrl = await mkExtractUns(url);
+    else if (host === "ok.ru") { const m = url.match(/\/(?:videoembed\/)?(\d+)(?:[/?#]|$)/i); if (m?.[1]) extractedUrl = await mkExtractOk(m[1]); }
+    else if (/streamsb\./i.test(host)) { const m = url.match(/\/(?:e\/|embed-)([a-zA-Z0-9]+)(?:\.html)?/i); if (m?.[1]) extractedUrl = await mkExtractStreamSB(m[1]); }
+    else if (/streamlare\./i.test(host)) { const m = url.match(/\/e\/([a-zA-Z0-9]+)/i); if (m?.[1]) extractedUrl = await mkExtractStreamlare(m[1]); }
+  } catch {}
+  return { name: src.sourceName || "", url, extractedUrl, extractedType: mkEmbedMediaType(extractedUrl), type: src.type, priority: src.priority, headers: { Referer: MK_REFERER, "User-Agent": MK_UA } };
+}
+
+// ─── MKissa Route Handlers ────────────────────────────────────────────────────
+async function mkHandleEpisodes(anilistId) {
+  const ck = `mk-episodes:${anilistId}`;
+  const c = getCached(ck); if (c) return c;
+  const { showId, show, anizip } = await mkResolveMkissaId(anilistId);
+  const epDetail = show.availableEpisodesDetail || {};
+  const subEps = (epDetail.sub || []).map(Number).sort((a, b) => a - b);
+  const dubEps = (epDetail.dub || []).map(Number).sort((a, b) => a - b);
+  const buildList = (nums, audio) => nums.map(n => {
+    const meta = anizip.episodes?.[String(n)] ?? {};
+    return { id: `mkissa/${anilistId}/${audio}/mkissa-${n}`, number: n, title: meta.title?.en || meta.title?.["x-jat"] || `Episode ${n}`, duration: meta.runtime ?? meta.length ?? 0, audio };
+  });
+  const result = { anilistId: Number(anilistId), mkissaId: showId, title: show.englishName || show.name, sub: buildList(subEps, "sub"), dub: buildList(dubEps, "dub") };
+  setCache(ck, result);
+  return result;
+}
+
+async function mkHandleWatch(anilistId, audio, epNum) {
+  const ck = `mk-watch:${anilistId}:${audio}:${epNum}`;
+  const c = getCached(ck); if (c) return c;
+  const { showId, show, anizip } = await mkResolveMkissaId(anilistId);
+  await mkWarmWatchPage(showId, show, epNum, audio);
+  const episode = await mkGetEpisodeSources(showId, epNum, audio);
+  if (!episode) throw new Error("Episode not found");
+  const sources = await Promise.all((episode.sourceUrls || []).map(mkExtractSource));
+  sources.sort((a, b) => (b.priority || 0) - (a.priority || 0));
+  const result = { anilistId: Number(anilistId), mkissaId: showId, episode: Number(epNum), audio, sources };
+  setCache(ck, result);
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  HLS PROXY — Rewrites m3u8 playlists and ts segments with correct Referer
+//  HLS PROXY
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function hlsProxy(req, res) {
   try {
-    const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).json({ error: "Missing ?url=" });
-
-    const referer = req.query.referer || "";
-    const origin = referer ? new URL(referer).origin : "";
-
-    const resp = await fetch(targetUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Referer: referer,
-        Origin: origin,
-      },
-      signal: AbortSignal.timeout(15000),
-    });
-
+    const targetUrl = req.query.url; if (!targetUrl) return res.status(400).json({ error: "Missing ?url=" });
+    const referer = req.query.referer || ""; const origin = referer ? new URL(referer).origin : "";
+    const resp = await fetch(targetUrl, { headers: { "User-Agent": MK_UA, Referer: referer, Origin: origin }, signal: AbortSignal.timeout(15000) });
     if (!resp.ok) return res.status(resp.status).send(`Upstream ${resp.status}`);
-
-    const ct = resp.headers.get("content-type") || "";
-    const body = await resp.text();
-
-    if (targetUrl.includes(".m3u8") || ct.includes("mpegurl") || ct.includes("octet-stream")) {
+    const ct = resp.headers.get("content-type") || ""; const body = await resp.text();
+    if (targetUrl.includes(".m3u8") || ct.includes("mpegurl")) {
       const base = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
       const proxyBase = `${req.protocol}://${req.get("host")}/hls-proxy`;
-
-      const rewritten = body
-        .split("\n")
-        .map(line => {
-          if (line.startsWith("#")) {
-            return line.replace(/URI="([^"]+)"/g, (_, uri) => {
-              const full = uri.startsWith("http") ? uri : base + uri;
-              return `URI="${proxyBase}?url=${encodeURIComponent(full)}&referer=${encodeURIComponent(referer)}"`;
-            });
-          }
-          if (!line.trim()) return line;
-          const full = line.startsWith("http") ? line : base + line;
-          return `${proxyBase}?url=${encodeURIComponent(full)}&referer=${encodeURIComponent(referer)}`;
-        })
-        .join("\n");
-
-      res.set("Content-Type", "application/vnd.apple.mpegurl");
-      return res.send(rewritten);
+      const rewritten = body.split("\n").map(line => { if (line.startsWith("#")) return line.replace(/URI="([^"]+)"/g, (_, uri) => { const full = uri.startsWith("http") ? uri : base + uri; return `URI="${proxyBase}?url=${encodeURIComponent(full)}&referer=${encodeURIComponent(referer)}"`; }); if (!line.trim()) return line; const full = line.startsWith("http") ? line : base + line; return `${proxyBase}?url=${encodeURIComponent(full)}&referer=${encodeURIComponent(referer)}`; }).join("\n");
+      res.set("Content-Type", "application/vnd.apple.mpegurl"); return res.send(rewritten);
     }
-
-    const buf = Buffer.from(body, "binary");
-    res.set("Content-Type", ct || "video/mp2t");
-    res.set("Content-Length", buf.length);
-    return res.send(buf);
-  } catch (err) {
-    res.status(502).json({ error: `HLS proxy error: ${err.message}` });
-  }
+    const buf = Buffer.from(body, "binary"); res.set("Content-Type", ct || "video/mp2t"); res.set("Content-Length", buf.length); return res.send(buf);
+  } catch (err) { res.status(502).json({ error: `HLS proxy: ${err.message}` }); }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -629,15 +499,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", async (_req, res) => {
-  const fsOk = await flaresolverrHealth().catch(() => false);
-  res.json({
-    status: "ok",
-    version: "4.1.0",
-    providers: ["animex", "pahe"],
-    flaresolverr: { url: FLARESOLVERR_URL, reachable: fsOk, session: PAHE_SESSION, lastSuccess: fsLastSuccess ? `${Math.round((Date.now() - fsLastSuccess) / 1000)}s ago` : "never", lastError: fsLastError },
-  });
-});
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "5.0.0", providers: ["animex", "mkissa"], mkissaCrypto: mkCryptoConfigCache ? `ok (buildId: ${mkCryptoConfigCache.buildId})` : "pending" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -648,67 +510,32 @@ app.get("/animex/anilist/:id", async (req, res) => { try { const r = await axAni
 app.get("/animex/episodes/:slug", async (req, res) => { try { res.json(await axEpisodes(req.params.slug)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/animex/sources/:slug/:ep", async (req, res) => { try { res.json(await axSources(req.params.slug, req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
 
-// ─── PAHE ROUTES ──────────────────────────────────────────────────────────────
-app.get("/pahe/search", async (req, res) => { try { res.json(await paheSearch(req.query.q)); } catch (e) { res.status(502).json({ error: `Pahe: ${e.message}` }); } });
-app.get("/pahe/episodes/:session", async (req, res) => { try { res.json(await paheEpisodes(req.params.session)); } catch (e) { res.status(502).json({ error: `Pahe: ${e.message}` }); } });
-app.get("/pahe/sources/:animeSession/:episodeSession", async (req, res) => { try { res.json(await paheSources(req.params.animeSession, req.params.episodeSession)); } catch (e) { res.status(502).json({ error: `Pahe: ${e.message}` }); } });
-app.get("/pahe/anilist/:id", async (req, res) => { try { const r = await anilistToPahe(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found on animepahe" }); } catch (e) { res.status(502).json({ error: e.message }); } });
+// ─── MKISSA ROUTES ────────────────────────────────────────────────────────────
+app.get("/mkissa/search", async (req, res) => { try { res.json(await mkSearch(req.query.q || "", req.query.mode || "sub")); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/mkissa/episodes/:anilistId", async (req, res) => { try { res.json(await mkHandleEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/mkissa/watch/:anilistId/:audio/:ep", async (req, res) => { try { res.json(await mkHandleWatch(+req.params.anilistId, req.params.audio, +req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
 
-// ─── PAHE FLARESOLVERR MANAGEMENT ─────────────────────────────────────────────
-app.get("/pahe/status", async (_req, res) => {
-  const fsOk = await flaresolverrHealth().catch(() => false);
-  res.json({
-    flaresolverr: { url: FLARESOLVERR_URL, reachable: fsOk },
-    session: PAHE_SESSION,
-    lastSuccess: fsLastSuccess ? new Date(fsLastSuccess).toISOString() : null,
-    lastError: fsLastError,
-  });
-});
-
-app.post("/pahe/session/reset", async (_req, res) => {
-  await flaresolverrReset();
-  res.json({ status: "ok", message: "FlareSolverr session reset" });
-});
-
-// ─── UNIFIED ROUTES (try both providers) ──────────────────────────────────────
+// ─── UNIFIED ROUTES ───────────────────────────────────────────────────────────
 app.get("/search", async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.status(400).json({ error: "Missing ?q=" });
-  const results = { animex: [], pahe: [] };
+  const q = req.query.q; if (!q) return res.status(400).json({ error: "Missing ?q=" });
+  const results = { animex: [], mkissa: [] };
   try { results.animex = await axSearch(q); } catch (e) { results.animex = { error: e.message }; }
-  try { results.pahe = await paheSearch(q); } catch (e) { results.pahe = { error: e.message }; }
+  try { results.mkissa = await mkSearch(q); } catch (e) { results.mkissa = { error: e.message }; }
   res.json(results);
 });
 
-app.get("/anilist/:id/stream", async (req, res) => {
-  const id = +req.params.id;
-  const ep = req.query.ep || 1;
-  const result = { animex: null, pahe: null };
-
-  try {
-    const mapping = await axAnilistToSlug(id);
-    if (mapping) {
-      result.animex = { anime: mapping, episodes: await axEpisodes(mapping.slug), sources: await axSources(mapping.slug, ep).catch(() => []) };
-    }
-  } catch (e) { result.animex = { error: e.message }; }
-
-  try {
-    const mapping = await anilistToPahe(id);
-    if (mapping) {
-      const episodes = await paheEpisodes(mapping.session);
-      const epData = episodes.find(e => e.number === +ep) || episodes[0];
-      result.pahe = { anime: mapping, episodes, sources: epData ? await paheSources(mapping.session, epData.session).catch(() => []) : [] };
-    }
-  } catch (e) { result.pahe = { error: e.message }; }
-
+app.get("/anilist/:id/episodes", async (req, res) => {
+  const id = +req.params.id; const result = { animex: null, mkissa: null };
+  try { const m = await axAnilistToSlug(id); if (m) result.animex = { anime: m, episodes: await axEpisodes(m.slug) }; } catch (e) { result.animex = { error: e.message }; }
+  try { result.mkissa = await mkHandleEpisodes(id); } catch (e) { result.mkissa = { error: e.message }; }
   res.json(result);
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v4.1 on :${PORT}`);
+  console.log(`LuffyTV API v5.0 on :${PORT}`);
   console.log(`  Animex: ${AX_GQL} + ${AX_REST.join(", ")}`);
-  console.log(`  Pahe:   ${PAHE_BASE} via FlareSolverr (${FLARESOLVERR_URL})`);
-  console.log(`  ⚠️  FlareSolverr MUST be running for animepahe to work!`);
-  console.log(`  Start with: docker-compose up -d`);
+  console.log(`  MKissa: ${MK_REFERER} → ${MK_API}`);
+  // Warm up MKissa crypto config
+  mkDiscoverCryptoConfig().then(c => console.log(`[MKissa] Crypto config warmed up: buildId=${c.buildId}`)).catch(e => console.warn(`[MKissa] Crypto warmup failed: ${e.message}`));
 });
