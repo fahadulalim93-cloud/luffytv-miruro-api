@@ -20,6 +20,7 @@ import { gotScraping } from "got-scraping";
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);
 const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || "http://localhost:8191/v1";
+const PAHE_COOKIES_ENV = process.env.PAHE_COOKIES || ""; // Manual cookie fallback: cf_clearance=xxx; __ddgid_=yyy
 
 // ─── Shared Cache ──────────────────────────────────────────────────────────────
 const cache = new Map();
@@ -172,9 +173,19 @@ async function paheRefreshCookies() {
 }
 
 async function paheGetCookies() {
+  // Check for manually set cookies from environment variable
+  if (PAHE_COOKIES_ENV && !paheCookies) {
+    paheCookies = {
+      cookieHeader: PAHE_COOKIES_ENV,
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+      timestamp: Date.now(),
+    };
+    console.log("[Pahe] Using PAHE_COOKIES from environment variable");
+  }
+
   if (paheCookies && (Date.now() - paheCookies.timestamp) < PAHE_COOKIE_TTL) {
-    // Proactive refresh if > 3.5 hours old
-    if ((Date.now() - paheCookies.timestamp) > (PAHE_COOKIE_TTL - 30 * 60 * 1000) && !paheIsRefreshing) {
+    // Proactive refresh if > 3.5 hours old (only for FlareSolverr-managed cookies, not env-set)
+    if (!PAHE_COOKIES_ENV && (Date.now() - paheCookies.timestamp) > (PAHE_COOKIE_TTL - 30 * 60 * 1000) && !paheIsRefreshing) {
       paheRefreshCookies().catch(e => console.warn("[Pahe] Background cookie refresh failed:", e.message));
     }
     return paheCookies;
@@ -725,7 +736,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", providers: ["animex", "pahe"], paheCookies: paheCookies ? `fresh (${Math.round((Date.now() - paheCookies.timestamp) / 60000)}m ago)` : "none" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "4.0.0", providers: ["animex", "pahe"], paheCfBypass: "FlareSolverr + got-scraping fallback", paheCookies: paheCookies ? `fresh (${Math.round((Date.now() - paheCookies.timestamp) / 60000)}m ago, cf_clearance: ${paheCookies.cookieHeader.includes("cf_clearance")})` : "none", flaresolverr: FLARESOLVERR_URL }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -739,7 +750,7 @@ app.get("/animex/sources/:slug/:ep", async (req, res) => { try { res.json(await 
 // ─── PAHE ROUTES ──────────────────────────────────────────────────────────────
 app.get("/pahe/search", async (req, res) => { try { res.json(await paheSearch(req.query.q)); } catch (e) { res.status(502).json({ error: `Pahe search: ${e.message}` }); } });
 app.get("/pahe/episodes/:session", async (req, res) => { try { res.json(await paheEpisodes(req.params.session)); } catch (e) { res.status(502).json({ error: `Pahe episodes: ${e.message}` }); } });
-app.get("/pahe/sources/:animeSession/:episodeSession", async (req, res) => { try { res.json(await paheSources(req.params.session, req.params.episodeSession)); } catch (e) { res.status(502).json({ error: `Pahe sources: ${e.message}` }); } });
+app.get("/pahe/sources/:animeSession/:episodeSession", async (req, res) => { try { res.json(await paheSources(req.params.animeSession, req.params.episodeSession)); } catch (e) { res.status(502).json({ error: `Pahe sources: ${e.message}` }); } });
 app.get("/pahe/anilist/:id", async (req, res) => { try { const r = await anilistToPahe(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found on animepahe" }); } catch (e) { res.status(502).json({ error: e.message }); } });
 
 // ─── PAHE COOKIE MANAGEMENT ───────────────────────────────────────────────────
