@@ -1,11 +1,15 @@
 /**
- * LuffyTV Miruro API — Combined Server
+ * LuffyTV Miruro API — Combined Server v4.0
  *
  * TWO providers running in parallel:
  *   - /animex/*  — animex.one (pp.animex.one + chad.anidap.lol fallback, 429 retry)
- *   - /pahe/*    — animepahe.pw (FlareSolverr + got-scraping CF bypass, Kwik m3u8)
+ *   - /pahe/*    — animepahe.pw (FlareSolverr CF UAM bypass, Kwik m3u8/HLS)
  *
  * Unified routes (/search, /anilist/:id/stream) try BOTH providers.
+ *
+ * FlareSolverr solves Cloudflare UAM challenges and returns cf_clearance cookies.
+ * Cookies are cached and auto-refreshed on 401/403 or expiry.
+ * Kwik embed pages are resolved via Node.js VM sandbox (mock Plyr/Hls → m3u8).
  */
 
 import express from "express";
@@ -15,10 +19,11 @@ import { gotScraping } from "got-scraping";
 
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);
+const FLARESOLVERR_URL = process.env.FLARESOLVERR_URL || "http://localhost:8191/v1";
 
 // ─── Shared Cache ──────────────────────────────────────────────────────────────
 const cache = new Map();
-function getCached(key) { const e = cache.get(key); if (e && Date.now()-e.ts < CACHE_TTL) return e.data; cache.delete(key); return null; }
+function getCached(key) { const e = cache.get(key); if (e && Date.now() - e.ts < CACHE_TTL) return e.data; cache.delete(key); return null; }
 function setCache(key, data) { cache.set(key, { data, ts: Date.now() }); }
 
 // ─── Shared Throttler ──────────────────────────────────────────────────────────
@@ -28,6 +33,13 @@ class Throttler {
   release() { this.running--; if (this.queue.length > 0) { this.running++; this.queue.shift()(); } }
 }
 
+// ─── Simple fetch helper ──────────────────────────────────────────────────────
+async function jsonFetch(url, opts = {}) {
+  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", ...opts.headers }, ...opts });
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
+  return res.json();
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  ANIMEX PROVIDER
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -35,520 +47,747 @@ class Throttler {
 const AX_GQL = "https://graphql.animex.one/graphql";
 const AX_REST = ["https://pp.animex.one/rest/api", "https://chad.anidap.lol/rest/api"];
 const AX_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  Accept: "application/json, text/plain, */*",
-  "Accept-Language": "en-US,en;q=0.5",
-  Origin: "https://animex.one",
-  Referer: "https://animex.one/",
-  "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-site",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  "Origin": "https://animex.one",
+  "Referer": "https://animex.one/",
 };
-const AX_PROVIDERS = {
-  beep:{name:"Beep",tip:"Soft sub, Fast (Default sub)",type:"hls"},
-  mimi:{name:"Mimi",tip:"Soft sub, Fastest, High quality (Default dub)",type:"hls"},
-  yuki:{name:"Yuki",tip:"Soft sub, Good, Multi quality",type:"hls"},
-  neko:{name:"Neko",tip:"Hard sub, Fast, High quality",type:"hls"},
-  sora:{name:"Sora",tip:"Soft sub, Fast, High quality",type:"hls"},
-  miku:{name:"Miku",tip:"Hard sub, Best Quality HLS",type:"hls"},
-  vee:{name:"Vee",tip:"Soft sub, DASH manifest",type:"dash"},
-  huzz:{name:"Huzz",tip:"Hard sub, HLS Alt",type:"hls"},
-  mochi:{name:"Mochi",tip:"Hard sub, MP4 with expiring token",type:"mp4"},
-  uwu:{name:"Uwu",tip:"Hard sub, HLS (Same CDN as Miku)",type:"hls"},
-  koto:{name:"Koto",tip:"Hard sub, HLS (Same CDN as Miku)",type:"hls"},
-  kami:{name:"Kami",tip:"Alt provider",type:"hls"},
-};
+const axThrottle = new Throttler(3);
 
-const axThrottler = new Throttler(2);
-const AX_MAX_RETRIES = 3;
-
-async function axRestFetch(path, opts = {}) {
-  await axThrottler.acquire();
+async function axGql(query, variables = {}) {
+  await axThrottle.acquire();
   try {
-    for (let h = 0; h < AX_REST.length; h++) {
-      const url = AX_REST[h] + path;
-      for (let attempt = 0; attempt <= AX_MAX_RETRIES; attempt++) {
-        const res = await fetch(url, { ...opts, headers: { ...AX_HEADERS, ...(opts.headers || {}) } });
-        if (res.ok) return await res.json();
-        const text = await res.text().catch(() => "");
-        let errData; try { errData = JSON.parse(text); } catch { errData = {}; }
-        if (res.status === 429) {
-          const wait = (errData.retry_after || 5) * 1000;
-          if (attempt < AX_MAX_RETRIES) { console.warn(`[AX 429] attempt ${attempt+1}/${AX_MAX_RETRIES} wait=${wait}ms`); await new Promise(r => setTimeout(r, wait)); continue; }
-          break;
+    const r = await fetch(AX_GQL, { method: "POST", headers: { "Content-Type": "application/json", ...AX_HEADERS }, body: JSON.stringify({ query, variables }) });
+    if (!r.ok) throw new Error(`GQL ${r.status}`);
+    const j = await r.json();
+    if (j.errors?.length) throw new Error(j.errors[0].message);
+    return j.data;
+  } finally { axThrottle.release(); }
+}
+
+async function axRest(path, retries = 2) {
+  for (const base of AX_REST) {
+    for (let i = 0; i <= retries; i++) {
+      await axThrottle.acquire();
+      try {
+        const r = await fetch(`${base}${path}`, { headers: AX_HEADERS, signal: AbortSignal.timeout(15000) });
+        if (r.status === 429) { const j = await r.json().catch(() => ({})); const wait = j.retry_after ? Math.min(j.retry_after * 1000, 30000) : 5000; console.warn(`[Animex] 429 from ${base}, waiting ${wait}ms`); await new Promise(r => setTimeout(r, wait)); continue; }
+        if (!r.ok) throw new Error(`REST ${r.status}`);
+        return await r.json();
+      } catch (e) { if (i === retries) console.warn(`[Animex] ${base}${path} failed: ${e.message}`); }
+      finally { axThrottle.release(); }
+    }
+  }
+  throw new Error("All animex REST endpoints failed");
+}
+
+async function axSearch(q) {
+  const d = await axGql(`query($s:String!){search(search:$s){id slug title coverImage{large}format episodes status}}`, { s: q });
+  return (d.search || []).map(a => ({ id: a.id, slug: a.slug, title: a.title, image: a.coverImage?.large, type: a.format, episodes: a.episodes, status: a.status }));
+}
+
+async function axAnilistToSlug(alId) {
+  const d = await axGql(`query($id:Int!){Media(id:$id,type:ANIME){id slug title{romaji}coverImage{large}}}`, { id: alId });
+  if (!d.Media) return null;
+  return { id: d.Media.id, slug: d.Media.slug, title: d.Media.title?.romaji, image: d.Media.coverImage?.large };
+}
+
+async function axEpisodes(slug) {
+  const d = await axRest(`/episodes?id=${slug}`);
+  const eps = d?.episodes || d?.data || [];
+  return Array.isArray(eps) ? eps.map((e, i) => ({ number: e.number ?? (i + 1), title: e.title || `Episode ${e.number ?? (i + 1)}`, slug: e.slug || e.id || String(e.number ?? (i + 1)) })) : [];
+}
+
+async function axSources(slug, ep) {
+  const d = await axRest(`/sources?id=${slug}&episode=${ep}`);
+  const srcs = d?.sources || d?.data || [];
+  return Array.isArray(srcs) ? srcs.map(s => ({ url: s.url || s.file, type: s.type || (s.url?.includes(".m3u8") ? "m3u8" : "mp4"), quality: s.quality || s.resolution || "auto", server: s.server || "animex" })) : [];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ANIMEPAHE PROVIDER  —  FlareSolverr CF UAM bypass + Kwik m3u8
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const PAHE_BASE = process.env.ANIMEPAHE_BASE || "https://animepahe.com";
+const ANILIST_API = "https://graphql.anilist.co";
+const paheThrottle = new Throttler(2);
+
+// ─── Cookie Manager ────────────────────────────────────────────────────────────
+let paheCookies = null;          // { cookieHeader: string, timestamp: number }
+let paheIsRefreshing = false;
+const PAHE_COOKIE_TTL = 4 * 60 * 60 * 1000; // 4 hours (cf_clearance usually lasts longer)
+
+async function paheRefreshCookies() {
+  if (paheIsRefreshing) return paheCookies?.cookieHeader;
+  paheIsRefreshing = true;
+  try {
+    console.log("[Pahe] Refreshing CF cookies via FlareSolverr...");
+    const res = await fetch(FLARESOLVERR_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cmd: "request.get", url: PAHE_BASE, maxTimeout: 60000 }),
+      signal: AbortSignal.timeout(70000),
+    });
+    if (!res.ok) throw new Error(`FlareSolverr HTTP ${res.status}`);
+    const data = await res.json();
+
+    if (data.status !== "ok" || !data.solution) {
+      throw new Error(`FlareSolverr failed: ${data.message || "unknown"}`);
+    }
+
+    const cookies = data.solution.cookies || [];
+    const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join("; ");
+    const userAgent = data.solution.userAgent || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+    if (!cookieHeader) throw new Error("No cookies from FlareSolverr");
+
+    paheCookies = { cookieHeader, userAgent, timestamp: Date.now() };
+    console.log(`[Pahe] Got ${cookies.length} cookies from FlareSolverr (cf_clearance: ${cookies.find(c => c.name === "cf_clearance") ? "YES" : "NO"})`);
+    return cookieHeader;
+  } catch (err) {
+    console.error(`[Pahe] FlareSolverr error: ${err.message}`);
+    // If FlareSolverr fails, try got-scraping as fallback
+    try {
+      console.log("[Pahe] Trying got-scraping fallback...");
+      const resp = await gotScraping({ url: PAHE_BASE, headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36" } });
+      const html = resp.body;
+      if (html && html.length > 500 && !html.includes("Just a moment") && !html.includes("Checking your browser")) {
+        const setCookies = resp.headers["set-cookie"];
+        if (setCookies) {
+          const cookieHeader = Array.isArray(setCookies) ? setCookies.map(c => c.split(";")[0]).join("; ") : setCookies.split(";")[0];
+          if (cookieHeader) {
+            paheCookies = { cookieHeader, userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", timestamp: Date.now() };
+            console.log("[Pahe] got-scraping fallback succeeded");
+            return cookieHeader;
+          }
         }
-        if (res.status === 403) break;
-        throw new Error(`AX API ${res.status}: ${text.slice(0,200)}`);
       }
+      throw new Error("got-scraping also blocked by CF");
+    } catch (fbErr) {
+      console.error(`[Pahe] All CF bypass methods failed: ${fbErr.message}`);
+      throw new Error(`CF bypass failed: ${err.message}`);
     }
-    throw new Error("AX: All hosts failed for " + path);
-  } finally { axThrottler.release(); }
+  } finally {
+    paheIsRefreshing = false;
+  }
 }
 
-async function axGqlFetch(query, variables) {
-  const res = await fetch(AX_GQL, { method: "POST", headers: { ...AX_HEADERS, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables }) });
-  if (!res.ok) throw new Error("AX GQL " + res.status);
-  return res.json();
+async function paheGetCookies() {
+  if (paheCookies && (Date.now() - paheCookies.timestamp) < PAHE_COOKIE_TTL) {
+    // Proactive refresh if > 3.5 hours old
+    if ((Date.now() - paheCookies.timestamp) > (PAHE_COOKIE_TTL - 30 * 60 * 1000) && !paheIsRefreshing) {
+      paheRefreshCookies().catch(e => console.warn("[Pahe] Background cookie refresh failed:", e.message));
+    }
+    return paheCookies;
+  }
+  await paheRefreshCookies();
+  return paheCookies;
 }
 
-async function axResolveSlug(anilistId) {
-  const ck = "ax:slug:" + anilistId;
-  const cached = getCached(ck); if (cached) return cached;
-  const data = await axGqlFetch("query($id:Int!){anime(anilistId:$id){id anilistId titleEnglish titleRomaji}}", { id: anilistId });
-  const anime = data?.data?.anime;
-  if (!anime?.id) throw new Error("AX: Not found for AniList ID " + anilistId);
-  const result = { slug: anime.id, anilistId: anime.anilistId, titleEnglish: anime.titleEnglish || "", titleRomaji: anime.titleRomaji || "" };
-  setCache(ck, result); return result;
-}
-
-async function axSearch(query) {
-  const ck = "ax:search:" + query.toLowerCase();
-  const cached = getCached(ck); if (cached) return cached;
-  const data = await axGqlFetch("query($q:String!){searchAnime(query:$q){items{id anilistId titleEnglish titleRomaji}}}", { q: query });
-  const results = (data?.data?.searchAnime?.items || []).map(i => ({ slug: i.id, anilistId: i.anilistId, titleEnglish: i.titleEnglish || "", titleRomaji: i.titleRomaji || "" }));
-  setCache(ck, results); return results;
-}
-
-async function axGetEpisodes(slug) {
-  const ck = "ax:eps:" + slug;
-  const cached = getCached(ck); if (cached) return cached;
-  const episodes = await axRestFetch("/episodes?id=" + encodeURIComponent(slug));
-  setCache(ck, episodes); return episodes;
-}
-
-async function axGetServers(slug, epNum) {
-  const data = await axRestFetch("/servers?id=" + encodeURIComponent(slug) + "&epNum=" + epNum);
-  const mapP = p => ({ id: p.id, default: p.default || false, tip: p.tip || "", ...(AX_PROVIDERS[p.id] || {}) });
-  return { sub: (data.subProviders || []).map(mapP), dub: (data.dubProviders || []).map(mapP) };
-}
-
-async function axGetSources(slug, epNum, type, providerId) {
-  const ck = "ax:src:" + slug + ":" + epNum + ":" + type + ":" + providerId;
-  const cached = getCached(ck); if (cached) return cached;
-  const data = await axRestFetch("/sources?id=" + encodeURIComponent(slug) + "&epNum=" + epNum + "&type=" + type + "&providerId=" + encodeURIComponent(providerId));
-  const result = {
-    provider: providerId, type,
-    sources: (data.sources || []).map(s => ({ url: s.url, quality: s.quality || "auto", type: s.type || "video/mpegurl", isM3U8: (s.url||"").includes(".m3u8") || (s.type||"").includes("mpegurl"), isMP4: (s.url||"").includes(".mp4") || (s.type||"").includes("mp4"), isDASH: (s.url||"").includes(".mpd") || (s.type||"").includes("dash") })),
-    tracks: (data.tracks || []).filter(t => t.url && !t.url.startsWith("https:///")).map(t => ({ id: t.id, url: t.url, lang: t.lang || "en", label: t.label || "English", kind: t.kind || "captions", default: t.default || false })),
-    headers: data.headers || {},
+// ─── Pahe HTTP request with CF cookies ────────────────────────────────────────
+async function paheFetch(url, opts = {}) {
+  const { cookieHeader, userAgent } = await paheGetCookies();
+  const headers = {
+    "User-Agent": userAgent,
+    "Cookie": cookieHeader,
+    "Referer": PAHE_BASE + "/",
+    "Accept": opts.accept || "application/json, text/html, */*",
+    ...opts.headers,
   };
-  setCache(ck, result); return result;
-}
 
-async function axGetAllSources(slug, epNum, type = "sub") {
-  const servers = await axGetServers(slug, epNum);
-  const plist = type === "dub" ? servers.dub : servers.sub;
-  const results = [];
-  for (const p of plist) {
-    try { const data = await axGetSources(slug, epNum, type, p.id); if (data?.sources?.length > 0) results.push({ ...data, providerName: p.name || p.id, default: p.default || false, tip: p.tip || "" }); }
-    catch (err) { console.warn("[AX] " + p.id + " failed: " + err.message); }
-  }
-  return results;
-}
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  ANIMEPAHE PROVIDER
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const PAHE_BASE = process.env.PAHE_BASE || "https://animepahe.pw";
-const FS_URL = process.env.FLARESOLVERR_URL || "http://flaresolverr:8191/v1";
-
-let paheCookies = "";
-let paheUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
-let fsAvailable = false;
-let paheReady = false;
-
-// FlareSolverr
-async function checkFS() {
+  await paheThrottle.acquire();
   try {
-    const res = await fetch(FS_URL.replace("/v1", ""), { method: "GET", signal: AbortSignal.timeout(5000) });
-    if (res.ok) { fsAvailable = true; console.log("[FS] FlareSolverr available"); return true; }
-  } catch {}
-  fsAvailable = false; console.log("[FS] FlareSolverr not available, using got-scraping"); return false;
-}
-
-async function fsRequest(url) {
-  const res = await fetch(FS_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cmd: "request.get", url, maxTimeout: 120000 }) });
-  if (!res.ok) throw new Error("FlareSolverr error: " + res.status);
-  const data = await res.json();
-  if (data.status !== "ok") throw new Error("FlareSolverr failed: " + (data.message || "unknown"));
-  const sol = data.solution || {};
-  if (sol.cookies) paheCookies = sol.cookies.map(c => c.name + "=" + c.value).join("; ");
-  if (sol.userAgent) paheUA = sol.userAgent;
-  return { status: sol.status || 200, body: sol.response || "" };
-}
-
-async function gsGet(url, extra = {}) {
-  const res = await gotScraping({ url, method: "GET", headers: { "User-Agent": paheUA, Accept: "application/json, text/html, */*", "Accept-Language": "en-US,en;q=0.5", Referer: PAHE_BASE + "/", Cookie: paheCookies, ...extra }, followRedirect: true, maxRedirects: 5, timeout: { request: 30000 } });
-  if (res.headers["set-cookie"]) { const arr = Array.isArray(res.headers["set-cookie"]) ? res.headers["set-cookie"] : [res.headers["set-cookie"]]; const nc = arr.map(h => h.split(";")[0].trim()).filter(c => c.length > 0); if (nc.length > 0) paheCookies = nc.join("; "); }
-  return { status: res.statusCode, body: res.body };
-}
-
-async function paheReq(url, extra = {}) {
-  if (fsAvailable) { try { const r = await fsRequest(url); if (r.status < 400) return r; } catch (e) { console.warn("[FS]", e.message); } }
-  return gsGet(url, extra);
-}
-
-async function initPahe() {
-  await checkFS();
-  if (fsAvailable) {
-    try { const r = await fsRequest(PAHE_BASE + "/"); paheReady = true; console.log("[PAHE] CF solved via FlareSolverr"); return; } catch {}
-  }
-  try { const r = await gsGet(PAHE_BASE + "/"); paheReady = true; console.log("[PAHE] Homepage loaded via got-scraping"); } catch { paheReady = true; }
-}
-
-// P.A.C.K.E.R decoder
-function unpackByRegex(packedStr) {
-  let m = packedStr.match(/\(['"]([^'"]+)['"]\s*,\s*(\d+)\s*,\s*['"]([^'"]+)['"]\s*,\s*['"]?([^'"]*?)['"]?\s*\)/);
-  if (!m) m = packedStr.match(/\(['"]([^'"]+)['"]\s*,\s*(\d+)\s*,\s*['"]([^'"]+)['"]\s*\)/);
-  if (!m) return null;
-  return doUnpack(m[1], 62, parseInt(m[2],10), m[3].split("|"));
-}
-
-function doUnpack(p, a, c, k) {
-  function be(n) { return n<a?""+e(n):be(Math.floor(n/a))+e(n%a); }
-  function e(n) { if(n<36)return n.toString(36); if(n<62)return String.fromCharCode(n-36+65); return n.toString(); }
-  const r = {};
-  for (let i=c-1;i>=0;i--) { const key=be(i); if(k[i]&&k[i].length>0) r[key]=k[i]; }
-  let result=p;
-  const keys=Object.keys(r).sort((a,b)=>b.length-a.length);
-  for (const key of keys) { result=result.replace(new RegExp("\\b"+key.replace(/[.*+?^${}()|[\]\\]/g,"\\$&")+"\\b","g"),r[key]); }
-  return result;
-}
-
-function extractM3U8(code) {
-  if (!code) return null;
-  for (const p of [/https?:\/\/[^\s'"]+\.m3u8[^\s'"]*/, /(?:source|src|url)\s*[:=]\s*['"]([^'"]+\.m3u8[^'"]*)['"]/]) {
-    const m=code.match(p); if(m) return m[1]||m[0];
-  }
-  return null;
-}
-
-function extractMP4(code) {
-  if (!code) return null;
-  const m=code.match(/https?:\/\/[^\s'"]+\.mp4[^\s'"]*/);
-  return m?m[0]:null;
-}
-
-function executePackerInVM(packedCode) {
-  let captured = null;
-  const sb = createContext({
-    document: { querySelector:()=>null, querySelectorAll:()=>[], getElementById:()=>null, getElementsByClassName:()=>[],
-      createElement:()=>({setAttribute:()=>{},getAttribute:()=>null,appendChild:()=>{},style:{},classList:{add:()=>{},remove:()=>{},contains:()=>false},addEventListener:()=>{},innerHTML:"",src:""}),
-      head:{appendChild:()=>{}},body:{appendChild:()=>{},style:{}},addEventListener:()=>{},removeEventListener:()=>{}},
-    window:{},
-    Plyr:function(){return{on:()=>{},play:()=>{},destroy:()=>{}}},
-    Hls:class{static isSupported(){return true}static Events={MANIFEST_PARSED:"mp"};constructor(){this.on=()=>{};this.loadSource=(s)=>{captured=captured||s};this.attachMedia=()=>{};this.startLoad=()=>{};this.destroy=()=>{}}},
-    eval:function(c){if(typeof c==="string"){captured=c;if(c.includes("eval(")){try{new Script(c,{filename:"inner.js"}).runInContext(sb)}catch(_){}}}return c},
-    console:{log:()=>{},warn:()=>{},error:()=>{},info:()=>{}},
-    setTimeout:(fn)=>{try{if(typeof fn==="function")fn()}catch(_){}return 0},
-    setInterval:()=>0,clearTimeout:()=>{},clearInterval:()=>{},
-    fetch:()=>Promise.resolve({ok:false}),XMLHttpRequest:function(){return{open:()=>{},send:()=>{},setRequestHeader:()=>{}}},
-    atob:(s)=>Buffer.from(s,"base64").toString("binary"),btoa:(s)=>Buffer.from(s,"binary").toString("base64"),
-    Buffer,String,Number,Math,Array,Object,RegExp,JSON,parseInt,parseFloat,isNaN,isFinite,
-  });
-  sb.window=sb;sb.self=sb;sb.top=sb;sb.parent=sb;
-  try{new Script(packedCode,{filename:"kwik.js"}).runInContext(sb,{timeout:5000});return captured}
-  catch(e){if(captured)return captured;throw e}
-}
-
-function decodeKwikPacker(html) {
-  const sr=/<script[^>]*>([\s\S]*?)<\/script>/gi;
-  let s,m3u8=null,mp4=null;
-  while((s=sr.exec(html))!==null){
-    const code=s[1].trim();
-    if(!code.includes("eval")||!code.includes("function(p"))continue;
-    try{const r=executePackerInVM(code);if(r){m3u8=m3u8||extractM3U8(r);mp4=mp4||extractMP4(r);if(m3u8)break}}catch(_){}
-    try{const r=unpackByRegex(code);if(r){m3u8=m3u8||extractM3U8(r);mp4=mp4||extractMP4(r);if(m3u8)break}}catch(_){}
-  }
-  if(!m3u8)m3u8=extractM3U8(html);
-  if(!mp4)mp4=extractMP4(html);
-  return{m3u8,mp4};
-}
-
-// AnimePahe API functions
-async function paheSearch(query) {
-  const ck="pahe:search:"+query.toLowerCase();
-  const cached=getCached(ck);if(cached)return cached;
-  const url=PAHE_BASE+"/api?m=search&q="+encodeURIComponent(query);
-  const res=await paheReq(url,{"X-Requested-With":"XMLHttpRequest"});
-  try{const d=JSON.parse(res.body);setCache(ck,d);return d}
-  catch(e){if(res.body.includes("Just a moment"))throw new Error("Cloudflare blocked. Deploy with FlareSolverr.");throw new Error("Pahe search error: "+res.body.slice(0,200))}
-}
-
-async function paheGetEpisodes(session,page=1) {
-  const ck="pahe:eps:"+session+":"+page;
-  const cached=getCached(ck);if(cached)return cached;
-  const url=PAHE_BASE+"/api?m=release&id="+encodeURIComponent(session)+"&sort=episode_desc&page="+page;
-  const res=await paheReq(url,{"X-Requested-With":"XMLHttpRequest"});
-  try{const d=JSON.parse(res.body);setCache(ck,d);return d}
-  catch(e){throw new Error("Pahe episodes error: "+res.body.slice(0,200))}
-}
-
-async function paheGetAllEpisodes(session) {
-  const ck="pahe:eps:all:"+session;
-  const cached=getCached(ck);if(cached)return cached;
-  let all=[],page=1,last=1;
-  while(page<=last){const d=await paheGetEpisodes(session,page);all=all.concat(d.data||[]);if(d.last_page)last=d.last_page;if(!d.next_page_url||page>=last)break;page++}
-  const result={total:all.length,episodes:all.map(ep=>({number:ep.episode,session:ep.session,createdAt:ep.created_at,fansub:ep.fansub||"unknown",quality:ep.quality||"1080"}))};
-  setCache(ck,result);return result;
-}
-
-async function paheGetPlayPage(animeSession,epSession) {
-  const res=await paheReq(PAHE_BASE+"/play/"+animeSession+"/"+epSession,{Accept:"text/html"});
-  return res.body;
-}
-
-function paheExtractKwikLinks(html) {
-  const links=[];let m;
-  const r1=/data-src=["']([^"']+)["']/g;while((m=r1.exec(html))!==null){if(m[1].includes("kwik"))links.push(m[1])}
-  const r2=/https?:\/\/kwik\.[a-z]+\/[ef]\/[a-zA-Z0-9]+/g;while((m=r2.exec(html))!==null){if(!links.includes(m[0]))links.push(m[0])}
-  return links;
-}
-
-function paheExtractQualityMap(html) {
-  const map={};let m;
-  const r1=/data-resolution=["'](\d+)["'][^>]*data-src=["'](https?:\/\/kwik\.[a-z]+\/[ef]\/[a-zA-Z0-9]+)["']/g;
-  while((m=r1.exec(html))!==null)map[m[2]]=parseInt(m[1],10);
-  const r2=/data-src=["'](https?:\/\/kwik\.[a-z]+\/[ef]\/[a-zA-Z0-9]+)["'][^>]*data-resolution=["'](\d+)["']/g;
-  while((m=r2.exec(html))!==null)map[m[1]]=parseInt(m[2],10);
-  return map;
-}
-
-async function paheGetKwikStream(kwikUrl) {
-  const ck="pahe:kwik:"+kwikUrl;const cached=getCached(ck);if(cached)return cached;
-  const res=await paheReq(kwikUrl,{Accept:"text/html",Referer:PAHE_BASE+"/",Origin:PAHE_BASE});
-  const{m3u8,mp4}=decodeKwikPacker(res.body);
-  let fM3U8=m3u8,fMP4=mp4;
-  if(!fM3U8&&!fMP4){const cdn=res.body.match(/https?:\/\/[a-zA-Z0-9.-]+\.kwik\.[a-z]+/);const path=res.body.match(/\/[a-zA-Z0-9_-]{6,}\/[a-zA-Z0-9_-]{6,}/);if(cdn&&path)fM3U8=cdn[0]+path[0]+"/index.m3u8"}
-  const result={kwikUrl,m3u8:fM3U8,mp4:fMP4,type:fM3U8?"hls":fMP4?"mp4":null};
-  if(fM3U8||fMP4)setCache(ck,result);return result;
-}
-
-async function paheGetEpisodeStreams(animeSession,epSession,qualityFilter) {
-  const ck="pahe:streams:"+animeSession+":"+epSession+":"+(qualityFilter||"all");
-  const cached=getCached(ck);if(cached)return cached;
-  const html=await paheGetPlayPage(animeSession,epSession);
-  const kwikLinks=paheExtractKwikLinks(html);
-  const qualityMap=paheExtractQualityMap(html);
-  if(kwikLinks.length===0)throw new Error("No kwik links found on play page");
-  const streams=[];
-  for(const kwikUrl of kwikLinks){
-    try{const r=await paheGetKwikStream(kwikUrl);if(r.m3u8||r.mp4){streams.push({url:r.m3u8||r.mp4,type:r.type,quality:qualityMap[kwikUrl]||1080,isM3U8:!!r.m3u8,isMP4:!!r.mp4,source:"kwik",provider:"animepahe"})}}catch(err){console.warn("[kwik] "+kwikUrl+": "+err.message)}
-  }
-  streams.sort((a,b)=>b.quality-a.quality);
-  let filtered=streams;
-  if(qualityFilter){const q=parseInt(qualityFilter,10);const exact=streams.filter(s=>s.quality===q);filtered=exact.length>0?exact:streams}
-  const result={totalFound:kwikLinks.length,totalDecoded:streams.length,streams:filtered};
-  setCache(ck,result);return result;
-}
-
-// Pahe AniList mapping
-const AL_GQL="https://graphql.anilist.co";
-async function anilistById(id){const q=`query($id:Int){Media(id:$id,type:ANIME){id title{romaji english native}episodes}}`;const res=await fetch(AL_GQL,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({query:q,variables:{id:parseInt(id,10)}})});if(!res.ok)throw new Error("AniList failed: "+res.status);return(await res.json()).data?.Media||null}
-
-const anilistToPahe=new Map();
-async function paheResolveAnilist(anilistId){
-  const cached=anilistToPahe.get(anilistId);if(cached&&Date.now()-cached.ts<CACHE_TTL)return cached;
-  const anime=await anilistById(anilistId);if(!anime)throw new Error("AniList ID "+anilistId+" not found");
-  const title=anime.title.english||anime.title.romaji||anime.title.native;
-  const results=await paheSearch(title);if(!results.data||results.data.length===0)throw new Error("Not found on AnimePahe: "+title);
-  const best=results.data[0];
-  const r={anilistId:anime.id,paheSession:best.session,paheTitle:best.title,anilistTitle:title,episodes:anime.episodes,ts:Date.now()};
-  anilistToPahe.set(anilistId,r);return r;
-}
-
-// ─── HLS Proxy (for pahe m3u8 streams) ────────────────────────────────────────
-async function proxyStream(req, res) {
-  try {
-    const { url, referer: customReferer } = req.query;
-    if (!url) return res.status(400).json({ error: "Missing ?url=", usage: "/proxy?url=<m3u8|ts>&referer=<referer>" });
-
-    // Auto-resolve kwik URLs
-    if (/kwik\.[a-z]+\/(?:e|f|d)\//i.test(url)) {
-      try { const result = await paheGetKwikStream(url); return res.redirect(302, `/proxy?url=${encodeURIComponent(result.m3u8)}&referer=${encodeURIComponent(PAHE_BASE+"/")}`); }
-      catch (e) { return res.status(500).json({ error: "Kwik resolution failed", details: e.message }); }
-    }
-
-    const urlObj = new URL(url);
-    const referer = customReferer || `${urlObj.protocol}//${urlObj.host}/`;
-
-    const upstream = await fetch(url, {
-      headers: {
-        "User-Agent": paheUA,
-        Referer: referer,
-        Origin: referer.replace(/\/$/, ""),
-        Accept: "*/*",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "cross-site",
-      },
+    const resp = await gotScraping({
+      url,
+      headers,
+      followRedirect: true,
+      timeout: { request: 20000 },
+      ...opts.gotOpts,
     });
 
-    if (!upstream.ok) return res.status(upstream.status).json({ error: `Upstream ${upstream.status}`, url });
+    const body = resp.body;
 
-    const ct = upstream.headers.get("content-type") || "";
-    const isM3U8 = ct.includes("mpegurl") || url.includes(".m3u8");
-
-    if (isM3U8) {
-      const text = await upstream.text();
-      const baseUrl = url.substring(0, url.lastIndexOf("/") + 1);
-      const rp = customReferer ? `&referer=${encodeURIComponent(customReferer)}` : "";
-      const modified = text.split("\n").map(line => {
-        const t = line.trim();
-        if (t.startsWith("#")) {
-          if (t.includes('URI="')) return t.replace(/URI="([^"]+)"/, (match, uri) => { let fullUrl = uri.startsWith("http") ? uri : baseUrl + uri; return `URI="/proxy?url=${encodeURIComponent(fullUrl)}${rp}"`; });
-          return line;
-        } else if (t && !t.startsWith("http")) return `/proxy?url=${encodeURIComponent(baseUrl + t)}${rp}`;
-        else if (t.startsWith("http")) return `/proxy?url=${encodeURIComponent(t)}${rp}`;
-        return line;
-      }).join("\n");
-      res.setHeader("Content-Type", "application/vnd.apple.mpegurl");
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      return res.send(modified);
+    // Check if we got a CF challenge page
+    if (body.includes("Just a moment") || body.includes("Checking your browser") || body.includes("challenge-platform")) {
+      console.warn("[Pahe] CF challenge detected, refreshing cookies...");
+      await paheRefreshCookies();
+      // Retry with fresh cookies
+      const fresh = await paheGetCookies();
+      const retryResp = await gotScraping({
+        url,
+        headers: { ...headers, Cookie: fresh.cookieHeader, "User-Agent": fresh.userAgent },
+        followRedirect: true,
+        timeout: { request: 20000 },
+        ...opts.gotOpts,
+      });
+      if (retryResp.body.includes("Just a moment") || retryResp.body.includes("Checking your browser")) {
+        throw new Error("Still blocked by CF after cookie refresh");
+      }
+      return retryResp;
     }
 
-    // Stream through (ts segments)
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Content-Type", ct || "video/mp2t");
-    if (upstream.headers.get("content-length")) res.setHeader("Content-Length", upstream.headers.get("content-length"));
-    const reader = upstream.body.getReader();
-    try { while (true) { const { done, value } = await reader.read(); if (done) break; res.write(value); } } catch {}
-    res.end();
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    return resp;
+  } finally {
+    paheThrottle.release();
+  }
 }
 
+// ─── Pahe Search ──────────────────────────────────────────────────────────────
+async function paheSearch(query) {
+  const ck = `pahe-search:${query}`;
+  const c = getCached(ck);
+  if (c) return c;
+
+  try {
+    const resp = await paheFetch(`${PAHE_BASE}/api?m=search&q=${encodeURIComponent(query)}`);
+    const data = JSON.parse(resp.body);
+    const results = (data.data || []).map(a => ({
+      id: a.id,
+      title: a.title,
+      image: a.poster,
+      type: a.type,
+      status: a.status,
+      year: a.year,
+      season: a.season,
+      session: a.session, // needed for episode fetching
+    }));
+    setCache(ck, results);
+    return results;
+  } catch (err) {
+    console.error(`Pahe search error: ${err.message}`);
+    throw err;
+  }
+}
+
+// ─── Pahe Episodes ────────────────────────────────────────────────────────────
+async function paheEpisodes(animeSession) {
+  const ck = `pahe-episodes:${animeSession}`;
+  const c = getCached(ck);
+  if (c) return c;
+
+  try {
+    // First, get the anime page to find the internal temp_id
+    const pageResp = await paheFetch(`${PAHE_BASE}/anime/${animeSession}`, { accept: "text/html, */*" });
+    const pageHtml = pageResp.body;
+
+    // Extract temp_id from og:url meta tag
+    let tempId = null;
+    const ogUrlMatch = pageHtml.match(/<meta\s+property="og:url"\s+content="[^"]*\/([^"]+)"/i);
+    if (ogUrlMatch) {
+      tempId = ogUrlMatch[1];
+    }
+
+    // Fallback: try to extract from the page HTML
+    if (!tempId) {
+      const idMatch = pageHtml.match(/"id"\s*:\s*(\d+)/);
+      if (idMatch) tempId = idMatch[1];
+    }
+
+    if (!tempId) {
+      // Try the anime session as the ID
+      tempId = animeSession;
+    }
+
+    // Fetch episodes from the release API (paginated)
+    const allEpisodes = [];
+    let page = 1;
+    let lastPage = 1;
+
+    do {
+      const resp = await paheFetch(`${PAHE_BASE}/api?m=release&id=${tempId}&sort=episode_asc&page=${page}`);
+      const data = JSON.parse(resp.body);
+      const episodes = data.data || [];
+
+      for (const ep of episodes) {
+        allEpisodes.push({
+          number: ep.episode,
+          title: `Episode ${ep.episode}`,
+          session: ep.session, // needed for source fetching
+          snapshot: ep.snapshot || null,
+        });
+      }
+
+      lastPage = data.last_page || 1;
+      page++;
+    } while (page <= lastPage && page <= 20); // safety limit
+
+    setCache(ck, allEpisodes);
+    return allEpisodes;
+  } catch (err) {
+    console.error(`Pahe episodes error: ${err.message}`);
+    throw err;
+  }
+}
+
+// ─── Pahe Sources (Kwik → m3u8) ──────────────────────────────────────────────
+async function paheSources(animeSession, episodeSession) {
+  const ck = `pahe-sources:${animeSession}:${episodeSession}`;
+  const c = getCached(ck);
+  if (c) return c;
+
+  try {
+    // Step 1: Fetch the play page
+    const playResp = await paheFetch(`${PAHE_BASE}/play/${animeSession}/${episodeSession}`, { accept: "text/html, */*" });
+    const playHtml = playResp.body;
+
+    // Step 2: Extract Kwik links from the play page
+    // Look for data-src attributes on buttons
+    const kwikLinks = [];
+    const buttonRegex = /<button[^>]*data-src="([^"]+)"[^>]*(?:data-fansub="([^"]*)")?[^>]*(?:data-resolution="([^"]*)")?[^>]*(?:data-audio="([^"]*)")?/gi;
+    let match;
+    while ((match = buttonRegex.exec(playHtml)) !== null) {
+      kwikLinks.push({
+        url: match[1],
+        fansub: match[2] || "unknown",
+        resolution: match[3] || "auto",
+        audio: match[4] || "jpn",
+      });
+    }
+
+    // Fallback: regex for any kwik.cx/si/link URLs
+    if (kwikLinks.length === 0) {
+      const kwikRegex = /https?:\/\/kwik\.(si|cx|link)\/e\/[^\s"'<>]+/gi;
+      while ((match = kwikRegex.exec(playHtml)) !== null) {
+        kwikLinks.push({ url: match[0], fansub: "unknown", resolution: "auto", audio: "jpn" });
+      }
+    }
+
+    if (kwikLinks.length === 0) {
+      throw new Error("No Kwik links found on play page");
+    }
+
+    // Step 3: Resolve each Kwik link to m3u8
+    const sources = [];
+    for (const kwik of kwikLinks) {
+      try {
+        const m3u8 = await resolveKwikM3U8(kwik.url);
+        if (m3u8) {
+          sources.push({
+            url: m3u8,
+            type: "m3u8",
+            quality: kwik.resolution || "auto",
+            server: `pahe-kwik`,
+            fansub: kwik.fansub,
+            audio: kwik.audio,
+            headers: {
+              Referer: kwik.url,
+              Origin: new URL(kwik.url).origin,
+            },
+          });
+        }
+      } catch (err) {
+        console.warn(`[Pahe] Kwik resolve failed for ${kwik.url}: ${err.message}`);
+      }
+    }
+
+    if (sources.length === 0) {
+      throw new Error("No m3u8 sources resolved from Kwik");
+    }
+
+    setCache(ck, sources);
+    return sources;
+  } catch (err) {
+    console.error(`Pahe sources error: ${err.message}`);
+    throw err;
+  }
+}
+
+// ─── Kwik m3u8 Resolution (VM Sandbox) ────────────────────────────────────────
+async function resolveKwikM3U8(kwikUrl) {
+  const ck = `kwik-m3u8:${kwikUrl}`;
+  const c = getCached(ck);
+  if (c) return c;
+
+  try {
+    // Fetch the Kwik embed page with proper Referer
+    const { cookieHeader, userAgent } = await paheGetCookies();
+    const resp = await gotScraping({
+      url: kwikUrl,
+      headers: {
+        "User-Agent": userAgent,
+        "Cookie": cookieHeader,
+        "Referer": PAHE_BASE + "/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      },
+      followRedirect: true,
+      timeout: { request: 15000 },
+    });
+
+    const html = resp.body;
+
+    // Quick check: is m3u8 directly in the HTML?
+    const directM3u8 = html.match(/https?:\/\/[^"'<>\s]+\.m3u8[^"'<>\s]*/i);
+    if (directM3u8) {
+      setCache(ck, directM3u8[0]);
+      return directM3u8[0];
+    }
+
+    // Extract all <script> blocks
+    const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi;
+    const scripts = [];
+    let scriptMatch;
+    while ((scriptMatch = scriptRegex.exec(html)) !== null) {
+      if (scriptMatch[1] && scriptMatch[1].trim().length > 20) {
+        scripts.push(scriptMatch[1]);
+      }
+    }
+
+    if (scripts.length === 0) {
+      throw new Error("No scripts found on Kwik page");
+    }
+
+    // Try each script in VM sandbox with mocked Plyr/Hls
+    for (const script of scripts) {
+      try {
+        const m3u8 = await executeKwikScript(script, kwikUrl);
+        if (m3u8) {
+          setCache(ck, m3u8);
+          return m3u8;
+        }
+      } catch (err) {
+        // Try next script
+      }
+    }
+
+    // Fallback: regex search entire HTML for uwucdn/stream patterns
+    const streamMatch = html.match(/https?:\/\/[^"'<>\s]+\/stream\/[^"'<>\s]+\.m3u8[^"'<>\s]*/i);
+    if (streamMatch) {
+      setCache(ck, streamMatch[0]);
+      return streamMatch[0];
+    }
+
+    throw new Error("Could not extract m3u8 from Kwik page");
+  } catch (err) {
+    console.error(`Kwik resolve error for ${kwikUrl}: ${err.message}`);
+    throw err;
+  }
+}
+
+// ─── VM Sandbox Execution for Kwik Scripts ────────────────────────────────────
+function executeKwikScript(scriptContent, pageUrl) {
+  return new Promise((resolve, reject) => {
+    const captured = new Set();
+    let resolved = false;
+
+    const finish = (val) => {
+      if (resolved) return;
+      resolved = true;
+      resolve(val);
+    };
+
+    // Timeout safety
+    const timer = setTimeout(() => finish(null), 3000);
+
+    try {
+      // Mock Plyr constructor — captures m3u8 from opts.sources
+      const Plyr = function (el, opts) {
+        try {
+          if (opts && Array.isArray(opts.sources)) {
+            for (const s of opts.sources) {
+              if (s && typeof s.src === "string" && s.src.includes(".m3u8")) {
+                captured.add(s.src);
+              }
+            }
+          }
+        } catch (e) {}
+        return { on: () => ({}), destroy: () => {} };
+      };
+      Plyr.isSupported = () => true;
+
+      // Mock Hls constructor — captures m3u8 from loadSource()
+      const Hls = function (cfg) {
+        const hlsObj = {
+          loadSource: (src) => {
+            try {
+              if (typeof src === "string" && src.includes(".m3u8")) {
+                captured.add(src);
+              }
+            } catch (e) {}
+          },
+          attachMedia: () => {},
+          on: () => {},
+          startLoad: () => {},
+          destroy: () => {},
+        };
+        return hlsObj;
+      };
+      Hls.isSupported = () => true;
+      Hls.Events = { MANIFEST_PARSED: "manifestParsed", ERROR: "error" };
+
+      // Mock DOM element
+      const mockVideo = { src: "", textContent: "", innerHTML: "", appendChild: () => {}, removeChild: () => {}, addEventListener: () => {}, removeEventListener: () => {}, setAttribute: () => {}, getAttribute: () => null, style: {}, classList: { add: () => {}, remove: () => {}, contains: () => false } };
+      const mockDoc = { getElementById: () => mockVideo, querySelector: () => mockVideo, querySelectorAll: () => [], getElementsByTagName: () => [], getElementsByClassName: () => [], createElement: () => ({...mockVideo, setAttribute: () => {}, classList: { add: () => {}, remove: () => {} } }), body: mockVideo, head: mockVideo, addEventListener: () => {}, removeEventListener: () => {}, cookie: "", referrer: PAHE_BASE + "/", domain: new URL(PAHE_BASE).hostname, title: "" };
+      const mockWin = { document: mockDoc, location: { href: pageUrl, origin: new URL(pageUrl).origin, hostname: new URL(pageUrl).hostname, protocol: "https:", assign: () => {}, replace: () => {}, reload: () => {} }, navigator: { userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36", plugins: [1, 2, 3], languages: ["en-US", "en"], webdriver: false }, self: null, top: null, parent: null, frames: [], localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, sessionStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} }, addEventListener: () => {}, removeEventListener: () => {}, atob: (s) => Buffer.from(s, "base64").toString("binary"), btoa: (s) => Buffer.from(s, "binary").toString("base64"), fetch: async () => ({ ok: true, text: async () => "", json: async () => ({}) }), XMLHttpRequest: function () { this.open = this.send = this.setRequestHeader = this.getResponseHeader = this.getAllResponseHeaders = () => {}; }, Image: function () { this.src = ""; }, MutationObserver: class { observe() {} disconnect() {} }, };
+      mockWin.self = mockWin;
+      mockWin.top = mockWin;
+      mockWin.parent = mockWin;
+
+      const sandbox = {
+        ...mockWin,
+        window: mockWin,
+        document: mockDoc,
+        Plyr,
+        Hls,
+        console: { log: () => {}, warn: () => {}, error: () => {}, info: () => {}, debug: () => {} },
+        setTimeout: (fn, ms) => { try { if (typeof fn === "function") return setTimeout(fn, Math.min(ms || 0, 1000)); return setTimeout(fn, ms); } catch (e) { return -1; } },
+        clearTimeout: (id) => clearTimeout(id),
+        setInterval: (fn, ms) => -1,
+        clearInterval: () => {},
+        requestAnimationFrame: (fn) => -1,
+        cancelAnimationFrame: () => {},
+        Math,
+        Date,
+        JSON,
+        Array,
+        Object,
+        String,
+        Number,
+        Boolean,
+        RegExp,
+        Error,
+        TypeError,
+        RangeError,
+        parseInt,
+        parseFloat,
+        isNaN,
+        isFinite,
+        encodeURIComponent,
+        decodeURIComponent,
+        encodeURI,
+        decodeURI,
+        undefined,
+        NaN,
+        Infinity,
+      };
+
+      const ctx = createContext(sandbox);
+
+      // Run the script
+      try {
+        new Script(scriptContent).runInContext(ctx, { timeout: 2000 });
+      } catch (e) {
+        // Script may throw but we may have captured the m3u8 already
+      }
+
+      // Also try evaluating eval() bodies directly
+      const evalMatches = [...scriptContent.matchAll(/eval\(([\s\S]*?)\)\s*;?/gi)];
+      for (const em of evalMatches) {
+        try {
+          if (em[1] && em[1].length > 10) {
+            new Script(em[1]).runInContext(ctx, { timeout: 1500 });
+          }
+        } catch (e) {}
+      }
+
+      // Check captured m3u8 URLs
+      if (captured.size > 0) {
+        clearTimeout(timer);
+        const m3u8 = Array.from(captured)[0];
+        finish(m3u8);
+        return;
+      }
+
+      // Check video.src
+      if (mockVideo.src && mockVideo.src.includes(".m3u8")) {
+        clearTimeout(timer);
+        finish(mockVideo.src);
+        return;
+      }
+
+      // Deep search: stringify sandbox and look for m3u8
+      try {
+        const str = JSON.stringify(sandbox);
+        const deepMatch = str.match(/https?:\/\/[^"\\]+\.m3u8[^"\\]*/i);
+        if (deepMatch) {
+          clearTimeout(timer);
+          finish(deepMatch[0]);
+          return;
+        }
+      } catch (e) {}
+
+      clearTimeout(timer);
+      finish(null);
+    } catch (err) {
+      clearTimeout(timer);
+      finish(null);
+    }
+  });
+}
+
+// ─── AniList ID → AnimePahe mapping ───────────────────────────────────────────
+async function anilistToPahe(alId) {
+  const ck = `al2pahe:${alId}`;
+  const c = getCached(ck);
+  if (c) return c;
+
+  try {
+    // Get anime title from AniList
+    const resp = await fetch(ANILIST_API, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: `query($id:Int!){Media(id:$id,type:ANIME){id title{romaji english native}synonyms}}`,
+        variables: { id: alId },
+      }),
+    });
+    const data = await resp.json();
+    const media = data.data?.Media;
+    if (!media) return null;
+
+    // Try each title variant to search on animepahe
+    const titles = [media.title?.romaji, media.title?.english, media.title?.native, ...(media.synonyms || [])].filter(Boolean);
+
+    for (const title of titles) {
+      const results = await paheSearch(title);
+      if (results.length > 0) {
+        // Find best match (exact or closest)
+        const exact = results.find(r => r.title.toLowerCase() === title.toLowerCase());
+        const result = exact || results[0];
+        setCache(ck, result);
+        return result;
+      }
+    }
+
+    return null;
+  } catch (err) {
+    console.error(`AniList→Pahe mapping error: ${err.message}`);
+    return null;
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  EXPRESS — Combined Routes
+//  HLS PROXY — Rewrites m3u8 playlists and ts segments with correct Referer
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function hlsProxy(req, res) {
+  try {
+    const targetUrl = req.query.url;
+    if (!targetUrl) return res.status(400).json({ error: "Missing ?url=" });
+
+    const referer = req.query.referer || "";
+    const origin = referer ? new URL(referer).origin : "";
+
+    const resp = await fetch(targetUrl, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        Referer: referer,
+        Origin: origin,
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (!resp.ok) return res.status(resp.status).send(`Upstream ${resp.status}`);
+
+    const ct = resp.headers.get("content-type") || "";
+    const body = await resp.text();
+
+    // If m3u8 playlist, rewrite URLs to go through our proxy
+    if (targetUrl.includes(".m3u8") || ct.includes("mpegurl") || ct.includes("octet-stream")) {
+      const base = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
+      const proxyBase = `${req.protocol}://${req.get("host")}/hls-proxy`;
+
+      const rewritten = body
+        .split("\n")
+        .map(line => {
+          if (line.startsWith("#")) {
+            // Rewrite URI= in EXT-X-MAP or EXT-X-KEY
+            return line.replace(/URI="([^"]+)"/g, (_, uri) => {
+              const full = uri.startsWith("http") ? uri : base + uri;
+              return `URI="${proxyBase}?url=${encodeURIComponent(full)}&referer=${encodeURIComponent(referer)}"`;
+            });
+          }
+          if (!line.trim()) return line;
+          // Rewrite segment URLs
+          const full = line.startsWith("http") ? line : base + line;
+          return `${proxyBase}?url=${encodeURIComponent(full)}&referer=${encodeURIComponent(referer)}`;
+        })
+        .join("\n");
+
+      res.set("Content-Type", "application/vnd.apple.mpegurl");
+      return res.send(rewritten);
+    }
+
+    // Otherwise pass through (ts segments, etc.)
+    const buf = Buffer.from(body, "binary");
+    res.set("Content-Type", ct || "video/mp2t");
+    res.set("Content-Length", buf.length);
+    return res.send(buf);
+  } catch (err) {
+    res.status(502).json({ error: `HLS proxy error: ${err.message}` });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  EXPRESS ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const app = express();
-app.use(cors()); app.use(express.json());
-app.use((req,res,next)=>{const s=Date.now();res.on("finish",()=>console.log(req.method+" "+req.path+" → "+res.statusCode+" ("+(Date.now()-s)+"ms)"));next()});
+app.use(cors());
+app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health",(req,res)=>res.json({status:"ok",service:"miruro-api",version:"3.0.0",providers:{animex:{status:"active",hosts:AX_REST},animepahe:{status:paheReady?"active":"init",site:PAHE_BASE,cfBypass:fsAvailable?"flaresolverr":"got-scraping",streamType:"m3u8/mp4 (HLS)"}},cache:cache.size,uptime:Math.floor(process.uptime())}));
+app.get("/health", (_req, res) => res.json({ status: "ok", providers: ["animex", "pahe"], paheCookies: paheCookies ? `fresh (${Math.round((Date.now() - paheCookies.timestamp) / 60000)}m ago)` : "none" }));
 
-// ─── ANIMEX Routes ─────────────────────────────────────────────────────────────
-app.get("/animex/providers",(req,res)=>res.json({providers:Object.entries(AX_PROVIDERS).map(([id,info])=>({id,...info}))}));
+// ─── HLS Proxy ────────────────────────────────────────────────────────────────
+app.get("/hls-proxy", hlsProxy);
 
-app.get("/animex/search",async(req,res)=>{try{const q=req.query.q;if(!q)return res.status(400).json({error:"Missing ?q="});const r=await axSearch(q);res.json({provider:"animex",query:q,count:r.length,results:r})}catch(e){res.status(500).json({error:e.message})}});
+// ─── ANIMEX ROUTES ────────────────────────────────────────────────────────────
+app.get("/animex/search", async (req, res) => { try { res.json(await axSearch(req.query.q)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/animex/anilist/:id", async (req, res) => { try { const r = await axAnilistToSlug(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found" }); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/animex/episodes/:slug", async (req, res) => { try { res.json(await axEpisodes(req.params.slug)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/animex/sources/:slug/:ep", async (req, res) => { try { res.json(await axSources(req.params.slug, req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
 
-app.get("/animex/anime/:anilistId/episodes",async(req,res)=>{try{const id=parseInt(req.params.anilistId,10);const info=await axResolveSlug(id);const eps=await axGetEpisodes(info.slug);const norm=eps.map(ep=>({number:ep.number,title:ep.titles?.en||ep.titles?.en_jp||ep.titles?.romaji||"Episode "+ep.number,titles:ep.titles||{}}));res.json({provider:"animex",anilistId:id,slug:info.slug,title:info.titleEnglish||info.titleRomaji,totalEpisodes:norm.length,episodes:norm})}catch(e){res.status(500).json({error:e.message})}});
+// ─── PAHE ROUTES ──────────────────────────────────────────────────────────────
+app.get("/pahe/search", async (req, res) => { try { res.json(await paheSearch(req.query.q)); } catch (e) { res.status(502).json({ error: `Pahe search: ${e.message}` }); } });
+app.get("/pahe/episodes/:session", async (req, res) => { try { res.json(await paheEpisodes(req.params.session)); } catch (e) { res.status(502).json({ error: `Pahe episodes: ${e.message}` }); } });
+app.get("/pahe/sources/:animeSession/:episodeSession", async (req, res) => { try { res.json(await paheSources(req.params.session, req.params.episodeSession)); } catch (e) { res.status(502).json({ error: `Pahe sources: ${e.message}` }); } });
+app.get("/pahe/anilist/:id", async (req, res) => { try { const r = await anilistToPahe(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found on animepahe" }); } catch (e) { res.status(502).json({ error: e.message }); } });
 
-app.get("/animex/anime/:anilistId/servers/:epNum",async(req,res)=>{try{const id=parseInt(req.params.anilistId,10),n=parseInt(req.params.epNum,10);const info=await axResolveSlug(id);const servers=await axGetServers(info.slug,n);res.json({provider:"animex",anilistId:id,episode:n,sub:servers.sub,dub:servers.dub})}catch(e){res.status(500).json({error:e.message})}});
+// ─── PAHE COOKIE MANAGEMENT ───────────────────────────────────────────────────
+app.get("/pahe/cookies", async (_req, res) => { try { await paheGetCookies(); res.json({ status: "ok", age: paheCookies ? `${Math.round((Date.now() - paheCookies.timestamp) / 60000)} minutes` : "none", hasCfClearance: paheCookies?.cookieHeader?.includes("cf_clearance") || false }); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.post("/pahe/cookies/refresh", async (_req, res) => { try { await paheRefreshCookies(); res.json({ status: "ok", message: "Cookies refreshed" }); } catch (e) { res.status(502).json({ error: e.message }); } });
 
-app.get("/animex/anime/:anilistId/stream/:epNum",async(req,res)=>{try{const id=parseInt(req.params.anilistId,10),n=parseInt(req.params.epNum,10),type=req.query.type==="dub"?"dub":"sub",prov=req.query.provider||null;const info=await axResolveSlug(id);let results;if(prov){const data=await axGetSources(info.slug,n,type,prov);results=data?.sources?.length>0?[data]:[];}else{results=await axGetAllSources(info.slug,n,type);}res.json({provider:"animex",anilistId:id,title:info.titleEnglish||info.titleRomaji,episode:n,type,provider:prov||"all",count:results.length,streams:results})}catch(e){res.status(500).json({error:e.message})}});
-
-// ─── ANIMEPAHE Routes ──────────────────────────────────────────────────────────
-app.get("/pahe/search",async(req,res)=>{try{const q=req.query.q;if(!q)return res.status(400).json({error:"Missing ?q="});const data=await paheSearch(q);const results=(data.data||[]).map(i=>({session:i.session,title:i.title,status:i.status||"unknown",type:i.type||"TV",episodes:i.episodes||0,poster:i.poster||""}));res.json({provider:"animepahe",query:q,count:results.length,results})}catch(e){res.status(500).json({error:e.message})}});
-
-app.get("/pahe/anime/:session/episodes",async(req,res)=>{try{const data=await paheGetAllEpisodes(req.params.session);res.json({provider:"animepahe",session:req.params.session,totalEpisodes:data.total,episodes:data.episodes})}catch(e){res.status(500).json({error:e.message})}});
-
-app.get("/pahe/anime/:session/stream/:epNum",async(req,res)=>{try{const s=req.params.session,n=parseInt(req.params.epNum,10),q=req.query.quality||null;const d=await paheGetAllEpisodes(s);const ep=d.episodes.find(e=>e.number===n);if(!ep)return res.status(404).json({error:"Episode "+n+" not found"});const streams=await paheGetEpisodeStreams(s,ep.session,q);res.json({provider:"animepahe",session:s,episode:n,quality:q||"all",totalDecoded:streams.totalDecoded,streams:streams.streams})}catch(e){res.status(500).json({error:e.message})}});
-
-app.get("/pahe/anime/:session/watch/:epNum",async(req,res)=>{try{const s=req.params.session,n=parseInt(req.params.epNum,10),q=req.query.quality||null;const d=await paheGetAllEpisodes(s);const ep=d.episodes.find(e=>e.number===n);if(!ep)return res.status(404).json({error:"Episode "+n+" not found"});const streams=await paheGetEpisodeStreams(s,ep.session,q);res.json({provider:"animepahe",session:s,episode:n,totalEpisodes:d.total,quality:q||"all",streams:streams.streams})}catch(e){res.status(500).json({error:e.message})}});
-
-app.get("/pahe/anilist/:id/episodes",async(req,res)=>{try{const id=parseInt(req.params.id,10);const m=await paheResolveAnilist(id);const d=await paheGetAllEpisodes(m.paheSession);res.json({provider:"animepahe",anilistId:id,paheSession:m.paheSession,title:m.anilistTitle,totalEpisodes:d.total,episodes:d.episodes})}catch(e){res.status(500).json({error:e.message})}});
-
-app.get("/pahe/anilist/:id/stream/:epNum",async(req,res)=>{try{const id=parseInt(req.params.id,10),n=parseInt(req.params.epNum,10),q=req.query.quality||null;const m=await paheResolveAnilist(id);const d=await paheGetAllEpisodes(m.paheSession);const ep=d.episodes.find(e=>e.number===n);if(!ep)return res.status(404).json({error:"Episode "+n+" not found"});const streams=await paheGetEpisodeStreams(m.paheSession,ep.session,q);res.json({provider:"animepahe",anilistId:id,title:m.anilistTitle,episode:n,quality:q||"all",streams:streams.streams})}catch(e){res.status(500).json({error:e.message})}});
-
-// ─── HLS Proxy ─────────────────────────────────────────────────────────────────
-app.get("/proxy", proxyStream);
-app.options("/proxy",(req,res)=>{res.setHeader("Access-Control-Allow-Origin","*");res.setHeader("Access-Control-Allow-Methods","GET,OPTIONS");res.setHeader("Access-Control-Allow-Headers","Range,Content-Type");res.sendStatus(200)});
-
-// ─── UNIFIED Routes (try both providers) ───────────────────────────────────────
-
-app.get("/search",async(req,res)=>{
-  try{
-    const q=req.query.q;if(!q)return res.status(400).json({error:"Missing ?q="});
-    const results={animex:[],animepahe:[]};
-    try{const ax=await axSearch(q);results.animex=ax.map(i=>({provider:"animex",slug:i.slug,anilistId:i.anilistId,title:i.titleEnglish||i.titleRomaji}))}catch{}
-    try{const p=await paheSearch(q);results.animepahe=(p.data||[]).map(i=>({provider:"animepahe",session:i.session,title:i.title,type:i.type||"TV",poster:i.poster||""}))}catch{}
-    res.json({query:q,animex:results.animex.length,animepahe:results.animepahe.length,results});
-  }catch(e){res.status(500).json({error:e.message})}
+// ─── UNIFIED ROUTES (try both providers) ──────────────────────────────────────
+app.get("/search", async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.status(400).json({ error: "Missing ?q=" });
+  const results = { animex: [], pahe: [] };
+  try { results.animex = await axSearch(q); } catch (e) { results.animex = { error: e.message }; }
+  try { results.pahe = await paheSearch(q); } catch (e) { results.pahe = { error: e.message }; }
+  res.json(results);
 });
 
-app.get("/anilist/:id/stream/:epNum",async(req,res)=>{
-  try{
-    const id=parseInt(req.params.id,10),n=parseInt(req.params.epNum,10),q=req.query.quality||null,type=req.query.type==="dub"?"dub":"sub";
-    const result={anilistId:id,episode:n,animex:null,animepahe:null};
+app.get("/anilist/:id/stream", async (req, res) => {
+  const id = +req.params.id;
+  const ep = req.query.ep || 1;
+  const result = { animex: null, pahe: null };
 
-    // Try animex
-    try{
-      const info=await axResolveSlug(id);
-      const streams=await axGetAllSources(info.slug,n,type);
-      if(streams.length>0)result.animex={title:info.titleEnglish||info.titleRomaji,count:streams.length,streams};
-    }catch{}
+  // Try animex
+  try {
+    const mapping = await axAnilistToSlug(id);
+    if (mapping) {
+      result.animex = { anime: mapping, episodes: await axEpisodes(mapping.slug), sources: await axSources(mapping.slug, ep).catch(() => []) };
+    }
+  } catch (e) { result.animex = { error: e.message }; }
 
-    // Try animepahe
-    try{
-      const m=await paheResolveAnilist(id);
-      const d=await paheGetAllEpisodes(m.paheSession);
-      const ep=d.episodes.find(e=>e.number===n);
-      if(ep){const streams=await paheGetEpisodeStreams(m.paheSession,ep.session,q);if(streams.totalDecoded>0)result.animepahe={title:m.anilistTitle,count:streams.totalDecoded,streams:streams.streams}}
-    }catch{}
+  // Try pahe
+  try {
+    const mapping = await anilistToPahe(id);
+    if (mapping) {
+      const episodes = await paheEpisodes(mapping.session);
+      const epData = episodes.find(e => e.number === +ep) || episodes[0];
+      result.pahe = { anime: mapping, episodes, sources: epData ? await paheSources(mapping.session, epData.session).catch(() => []) : [] };
+    }
+  } catch (e) { result.pahe = { error: e.message }; }
 
-    res.json(result);
-  }catch(e){res.status(500).json({error:e.message})}
+  res.json(result);
 });
 
-app.get("/anilist/:id/episodes",async(req,res)=>{
-  try{
-    const id=parseInt(req.params.id,10);
-    const result={anilistId:id,animex:null,animepahe:null};
+// ─── Start ────────────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`LuffyTV API v4.0 on :${PORT}`);
+  console.log(`  Animex: ${AX_GQL} + ${AX_REST.join(", ")}`);
+  console.log(`  Pahe:   ${PAHE_BASE} (FlareSolverr: ${FLARESOLVERR_URL})`);
 
-    try{const info=await axResolveSlug(id);const eps=await axGetEpisodes(info.slug);result.animex={title:info.titleEnglish||info.titleRomaji,total:eps.length,episodes:eps.map(ep=>({number:ep.number,title:ep.titles?.en||ep.titles?.en_jp||"Episode "+ep.number}))}}catch{}
-    try{const m=await paheResolveAnilist(id);const d=await paheGetAllEpisodes(m.paheSession);result.animepahe={title:m.anilistTitle,total:d.total,episodes:d.episodes}}catch{}
-
-    res.json(result);
-  }catch(e){res.status(500).json({error:e.message})}
+  // Proactively warm up pahe cookies on startup
+  paheRefreshCookies().then(() => console.log("[Pahe] Startup cookie warmup OK")).catch(e => console.warn(`[Pahe] Startup cookie warmup failed: ${e.message}`));
 });
-
-// ─── Cache ─────────────────────────────────────────────────────────────────────
-app.delete("/cache",(req,res)=>{const s=cache.size;cache.clear();anilistToPahe.clear();res.json({cleared:true,entries:s})});
-
-// ─── 404 ───────────────────────────────────────────────────────────────────────
-app.use((req,res)=>res.status(404).json({error:"Not found",endpoints:[
-  "GET /health",
-  "── Animex ──",
-  "GET /animex/providers",
-  "GET /animex/search?q=",
-  "GET /animex/anime/:anilistId/episodes",
-  "GET /animex/anime/:anilistId/servers/:epNum",
-  "GET /animex/anime/:anilistId/stream/:epNum?type=sub&provider=",
-  "── AnimePahe ──",
-  "GET /pahe/search?q=",
-  "GET /pahe/anime/:session/episodes",
-  "GET /pahe/anime/:session/stream/:epNum?quality=1080",
-  "GET /pahe/anilist/:id/stream/:epNum",
-  "── Unified ──",
-  "GET /search?q=",
-  "GET /anilist/:id/episodes",
-  "GET /anilist/:id/stream/:epNum",
-  "── Proxy ──",
-  "GET /proxy?url=<m3u8|ts>&referer=<referer>",
-  "DELETE /cache",
-]}));
-
-// ─── Start ─────────────────────────────────────────────────────────────────────
-app.listen(PORT,async()=>{
-  console.log("\n  ╔══════════════════════════════════════════════╗");
-  console.log("  ║   LuffyTV Miruro API v3.0                    ║");
-  console.log("  ║   Animex + AnimePahe — Dual Providers         ║");
-  console.log("  ╚════════════════════════════════════════════════╝\n");
-  console.log("  Port:     "+PORT);
-  console.log("  ── Animex ──");
-  console.log("  GraphQL:  graphql.animex.one");
-  console.log("  REST:     pp.animex.one → chad.anidap.lol");
-  console.log("  ── AnimePahe ──");
-  console.log("  Site:     "+PAHE_BASE);
-  console.log("  Provider: kwik.cx → m3u8/mp4 (HLS)");
-  console.log("  CF:       "+(fsAvailable?"FlareSolverr":"got-scraping"));
-  console.log("  ── Proxy ──");
-  console.log("  HLS:      /proxy?url=<m3u8>&referer=<referer>\n");
-  await initPahe();
-});
-
-process.on("unhandledRejection",(err)=>console.error("[unhandledRejection]",err?.message||err));
-process.on("uncaughtException",(err)=>console.error("[uncaughtException]",err?.message||err));
