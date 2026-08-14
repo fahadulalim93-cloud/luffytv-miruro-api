@@ -1,10 +1,11 @@
 /**
- * LuffyTV Miruro API — Combined Server v7.0
+ * LuffyTV Miruro API — Combined Server v7.6.0
  *
- * THREE providers running in parallel:
+ * FOUR providers running in parallel:
  *   - /anidap/*  — anidap.lol (native API: search + AniList ID lookup + chad.anidap.lol REST)
  *   - /kaa/*     — kaa.lt (fsearch API, episode servers, HLS via krussdomi)
  *   - /mkissa/*  — mkissa.to (encrypted API, multi-embed extractor, m3u8/mp4)
+ *   - /miruro/*  — miruro.tv (pipe API: base64+gzip encoded, proxy required on VPS)
  *
  * Unified routes (/search, /anilist/:id/episodes) try ALL providers.
  */
@@ -1101,6 +1102,7 @@ async function hlsProxy(req, res) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 import { gunzipSync } from "node:zlib";
+import { CookieJar } from "tough-cookie";
 
 const MIRURO_PIPE = "https://www.miruro.tv/api/secure/pipe";
 const MIRURO_H = {
@@ -1112,7 +1114,39 @@ const MIRURO_H = {
   "sec-fetch-mode": "cors",
   "sec-fetch-dest": "empty",
 };
-const miruroThrottle = new Throttler(3);
+const miruroThrottle = new Throttler(5);
+
+// Per-proxy session: each proxy gets its own cookie jar warmed up with a homepage visit
+// This is critical — Cloudflare issues per-IP cookies, so a shared jar breaks when proxy changes
+const miruroSessions = new Map();  // proxyUrl → { jar: CookieJar, warmedUp: boolean, lastUsed: number }
+
+async function miruroGetSession(proxyUrl) {
+  let session = miruroSessions.get(proxyUrl);
+  if (!session) {
+    session = { jar: new CookieJar(), warmedUp: false, lastUsed: 0 };
+    miruroSessions.set(proxyUrl, session);
+  }
+  // Warm up if needed — visit homepage to get Cloudflare cookies for this proxy IP
+  if (!session.warmedUp) {
+    console.log(`[Miruro] Warming up session for proxy ${proxyUrl.replace(/\/\/[^@]+@/, "//***@")}`);
+    try {
+      const gr = await gotScraping("https://www.miruro.tv/", {
+        headers: { "User-Agent": MIRURO_H["User-Agent"] },
+        timeout: { request: 15000 },
+        followRedirect: true,
+        cookieJar: session.jar,
+        agent: { http: undefined, https: undefined },
+        proxyUrl,
+      });
+      session.warmedUp = gr.statusCode === 200;
+      console.log(`[Miruro] Warm-up ${session.warmedUp ? "OK" : "FAILED (" + gr.statusCode + ")"}`);
+    } catch (e) {
+      console.warn(`[Miruro] Warm-up failed: ${e.message}`);
+    }
+  }
+  session.lastUsed = Date.now();
+  return session;
+}
 
 // Encode pipe request: base64url(JSON)
 function miruroEncode(payload) {
@@ -1147,37 +1181,109 @@ function miruroDeepTranslate(obj) {
   }
 }
 
-// Fetch from miruro pipe — needs got-scraping (browser TLS) for Cloudflare
-async function miruroFetch(path, query) {
+// Warm up miruro sessions — pre-warm a few proxy sessions at startup
+async function miruroWarmUp() {
+  console.log(`[Miruro] Pre-warming proxy sessions...`);
+  const warmProxies = PROXY_POOL.slice(0, 3);
+  await Promise.all(warmProxies.map(p => miruroGetSession(p).catch(() => {})));
+  const ready = [...miruroSessions.values()].filter(s => s.warmedUp).length;
+  console.log(`[Miruro] ${ready}/${warmProxies.length} proxy sessions ready`);
+}
+
+// Fetch from miruro pipe — VPS always gets 403 from Cloudflare, so always use proxy+got-scraping
+// Each proxy gets its own cookie jar (Cloudflare issues per-IP cookies)
+async function miruroFetch(path, query, retryProxy = true) {
   const payload = { path, method: "GET", query, body: null, version: "0.1.0" };
   const encoded = miruroEncode(payload);
   const url = `${MIRURO_PIPE}?e=${encoded}`;
   await miruroThrottle.acquire();
   try {
-    // Try regular fetch first (works on residential IPs)
-    const r = await fetch(url, { headers: MIRURO_H, signal: AbortSignal.timeout(15000) });
-    const ct = r.headers.get("content-type") || "";
-    // If Cloudflare returns HTML challenge page, fall back to got-scraping
-    if (ct.includes("text/html") || r.status === 403 || r.status === 503) {
-      const proxy = nextProxy();
-      console.warn(`[Miruro] fetch blocked (HTTP ${r.status} / ${ct.slice(0,30)}), retrying via proxy`);
+    // Try regular fetch first (fast — works on residential IPs)
+    try {
+      const r = await fetch(url, { headers: MIRURO_H, signal: AbortSignal.timeout(10000) });
+      const ct = r.headers.get("content-type") || "";
+      if (r.ok && (ct.includes("application/json") || ct.includes("text/plain") || !ct.includes("text/html"))) {
+        const text = await r.text();
+        if (!text.startsWith("<!DOCTYPE") && !text.startsWith("<html")) {
+          try { return miruroDecode(text.trim()); } catch {}
+        }
+      }
+    } catch {}
+
+    // Direct fetch blocked — use got-scraping with proxy + per-proxy session
+    const proxy = nextProxy();
+    const session = await miruroGetSession(proxy);
+    const proxySafe = proxy.replace(/\/\/[^@]+@/, "//***@");
+
+    if (!session.warmedUp) {
+      // This proxy can't get past Cloudflare, try next one
+      const proxy2 = nextProxy();
+      const session2 = await miruroGetSession(proxy2);
+      if (!session2.warmedUp) throw new Error("No working proxy sessions available");
+      const ps2 = proxy2.replace(/\/\/[^@]+@/, "//***@");
+      console.log(`[Miruro] Fetching ${path} via proxy ${ps2}`);
       const gr = await gotScraping(url, {
         headers: MIRURO_H,
-        timeout: { request: 15000 },
+        timeout: { request: 12000 },
         followRedirect: true,
+        cookieJar: session2.jar,
+        agent: { http: undefined, https: undefined },
+        proxyUrl: proxy2,
+      });
+      if (gr.statusCode >= 400) throw new Error(`HTTP ${gr.statusCode}: ${gr.body.slice(0, 80)}`);
+      return miruroDecode(gr.body.trim());
+    }
+
+    console.log(`[Miruro] Fetching ${path} via proxy ${proxySafe}`);
+    const gr = await gotScraping(url, {
+      headers: MIRURO_H,
+      timeout: { request: 12000 },
+      followRedirect: true,
+      cookieJar: session.jar,
+      agent: { http: undefined, https: undefined },
+      proxyUrl: proxy,
+    });
+
+    // Handle 403 — session cookies expired, re-warm and retry
+    if (gr.statusCode === 403) {
+      console.warn(`[Miruro] Got 403, re-warming session for proxy ${proxySafe}`);
+      session.warmedUp = false;
+      const freshSession = await miruroGetSession(proxy);
+      const gr2 = await gotScraping(url, {
+        headers: MIRURO_H,
+        timeout: { request: 12000 },
+        followRedirect: true,
+        cookieJar: freshSession.jar,
         agent: { http: undefined, https: undefined },
         proxyUrl: proxy,
       });
-      if (gr.statusCode >= 400) throw new Error(`HTTP ${gr.statusCode}`);
-      return miruroDecode(gr.body.trim());
+      if (gr2.statusCode >= 400) throw new Error(`HTTP ${gr2.statusCode}: ${gr2.body.slice(0, 80)}`);
+      return miruroDecode(gr2.body.trim());
     }
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const text = await r.text();
-    return miruroDecode(text.trim());
+
+    // Handle 444/500 — try different proxy once (only for episodes, not source to save time)
+    if ((gr.statusCode === 444 || gr.statusCode === 500) && retryProxy && path === "episodes") {
+      const proxy2 = nextProxy();
+      console.warn(`[Miruro] Got HTTP ${gr.statusCode}, retrying with different proxy`);
+      const session2 = await miruroGetSession(proxy2);
+      const gr2 = await gotScraping(url, {
+        headers: MIRURO_H,
+        timeout: { request: 12000 },
+        followRedirect: true,
+        cookieJar: session2.jar,
+        agent: { http: undefined, https: undefined },
+        proxyUrl: proxy2,
+      });
+      if (gr2.statusCode >= 400) throw new Error(`HTTP ${gr2.statusCode}: ${gr2.body.slice(0, 80)}`);
+      return miruroDecode(gr2.body.trim());
+    }
+
+    if (gr.statusCode >= 400) throw new Error(`HTTP ${gr.statusCode}: ${gr.body.slice(0, 80)}`);
+    return miruroDecode(gr.body.trim());
   } finally { miruroThrottle.release(); }
 }
 
-// Miruro episodes — returns { providers: { name: { episodes: { sub: [], dub: [] } } } }
+// Miruro episodes — returns { mappings, providers: { name: { episodes: { sub: [], dub: [] } } } }
 async function miruroEpisodes(anilistId) {
   const ck = `mir-eps:${anilistId}`;
   const c = getCached(ck); if (c) return c;
@@ -1187,7 +1293,26 @@ async function miruroEpisodes(anilistId) {
   return data;
 }
 
+// Miruro servers — list available providers for a specific episode
+async function miruroServers(anilistId, epNum) {
+  const epData = await miruroEpisodes(anilistId);
+  const providers = epData?.providers || {};
+  const result = { sub: [], dub: [] };
+
+  for (const [name, provData] of Object.entries(providers)) {
+    const subEps = provData?.episodes?.sub || [];
+    const dubEps = provData?.episodes?.dub || [];
+    const hasSub = subEps.some(e => e.number === epNum);
+    const hasDub = dubEps.some(e => e.number === epNum);
+    if (hasSub) result.sub.push({ id: name, name });
+    if (hasDub) result.dub.push({ id: name, name });
+  }
+
+  return result;
+}
+
 // Miruro sources — episodeId, provider, category (sub/dub)
+// Returns streams in standardized format
 async function miruroSources(episodeId, provider, anilistId, category = "sub") {
   const ck = `mir-src:${episodeId}:${provider}:${category}`;
   const c = getCached(ck); if (c) return c;
@@ -1198,72 +1323,106 @@ async function miruroSources(episodeId, provider, anilistId, category = "sub") {
   return data;
 }
 
-// Miruro all-sources — fetch all providers for an episode
-async function miruroAllSources(anilistId, epNum, category = "sub") {
-  const ck = `mir-allsrc:${anilistId}:${epNum}:${category}`;
+// Normalize miruro streams response → standardized format
+// Miruro returns: { streams: [{ url, type, quality, server, referer }], thumbnail }
+function miruroNormalizeStreams(raw, provider) {
+  if (!raw) return null;
+
+  // Handle both `streams` (miruro format) and `sources` (anidap-like format)
+  const rawStreams = Array.isArray(raw?.streams) ? raw.streams : [];
+  const rawSources = Array.isArray(raw?.sources) ? raw.sources : [];
+  const allStreams = rawStreams.length ? rawStreams : rawSources;
+
+  // Filter to only playable streams (hls, mp4 — skip embeds like ok.ru, streamtape etc.)
+  const playable = allStreams.filter(s => {
+    const t = (s.type || "").toLowerCase();
+    return t === "hls" || t === "mp4" || t === "mp4upload" || (s.url && /\.m3u8|\.mp4/.test(s.url));
+  });
+  if (playable.length === 0) return null;  // skip provider if no playable streams
+
+  const streamUrls = playable.map(s => s.url || s.file).filter(Boolean);
+  if (streamUrls.length === 0) return null;
+
+  // Build referer headers from stream data
+  const referer = playable[0]?.referer || raw?.headers?.Referer || raw?.headers?.referer;
+  const headers = referer ? { Referer: referer } : (raw?.headers && Object.keys(raw.headers).length ? raw.headers : undefined);
+
+  // Intro/outro from chapters
+  const chapters = Array.isArray(raw?.chapters) ? raw.chapters : [];
+  const intro = chapters.find(c => /intro/i.test(c.title || ""));
+  const outro = chapters.find(c => /outro|ending/i.test(c.title || ""));
+
+  // Subtitles from tracks
+  const tracks = Array.isArray(raw?.tracks) ? raw.tracks : [];
+  const subs = tracks.filter(t => t?.url && (t.kind === "captions" || t.kind === "subtitles"))
+    .map(t => ({ url: t.url, lang: t.lang || t.label || "en", label: t.label || "" }));
+
+  return {
+    provider,
+    url: streamUrls[0],
+    urls: streamUrls,
+    quality: playable[0]?.quality || "auto",
+    type: playable[0]?.type || "hls",
+    server: playable[0]?.server || undefined,
+    isHardSub: false,
+    subs,
+    intro: intro ? { start: intro.start, end: intro.end } : undefined,
+    outro: outro ? { start: outro.start, end: outro.end } : undefined,
+    headers,
+  };
+}
+
+// Miruro all-sources — fetch ALL providers for an episode, returns { sub: [], dub: [] }
+// Same format as anidap all-sources for consistency
+async function miruroAllSources(anilistId, epNum) {
+  const ck = `mir-allsrc:${anilistId}:${epNum}`;
   const c = getCached(ck); if (c) return c;
   
   // Get episodes first to find provider + episode IDs
   const epData = await miruroEpisodes(anilistId);
   const providers = epData?.providers || {};
   
-  const results = [];
+  const out = { sub: [], dub: [] };
   const tasks = [];
   let delay = 0;
   
-  for (const [provName, provData] of Object.entries(providers)) {
-    const eps = provData?.episodes?.[category] || [];
-    const ep = eps.find(e => e.number === epNum);
-    if (!ep || !ep.id) continue;
-    
-    const epId = ep.id;
-    tasks.push({
-      provider: provName,
-      category,
-      promise: (async () => {
-        await new Promise(r => setTimeout(r, delay));
-        try { return await miruroSources(epId, provName, anilistId, category); }
-        catch { return null; }
-      })(),
-    });
-    delay += 200;
+  // Build tasks for both sub and dub
+  for (const category of ["sub", "dub"]) {
+    for (const [provName, provData] of Object.entries(providers)) {
+      const eps = provData?.episodes?.[category] || [];
+      const ep = eps.find(e => e.number === epNum);
+      if (!ep || !ep.id) continue;
+      
+      const epId = ep.id;
+      const cat = category;
+      tasks.push({
+        provider: provName,
+        category: cat,
+        promise: (async () => {
+          await new Promise(r => setTimeout(r, delay));
+          try {
+            const raw = await miruroSources(epId, provName, anilistId, cat);
+            return { raw, provider: provName, category: cat };
+          } catch {
+            return null;
+          }
+        })(),
+      });
+      delay += 250; // 250ms stagger to avoid rate limits
+    }
   }
   
   const responses = await Promise.all(tasks.map(t => t.promise));
   
-  for (let i = 0; i < tasks.length; i++) {
-    const { provider, category: cat } = tasks[i];
-    const raw = responses[i];
-    if (!raw) continue;
-    
-    const sources = Array.isArray(raw?.sources) ? raw.sources : [];
-    const streamUrls = sources.map(s => s.url || s.file).filter(Boolean);
-    if (streamUrls.length === 0) continue;
-    
-    const tracks = Array.isArray(raw?.tracks) ? raw.tracks : [];
-    const subs = tracks.filter(t => t?.url && (t.kind === "captions" || t.kind === "subtitles"))
-      .map(t => ({ url: t.url, lang: t.lang || t.label || "en", label: t.label || "" }));
-    
-    const chapters = Array.isArray(raw?.chapters) ? raw.chapters : [];
-    const intro = chapters.find(c => /intro/i.test(c.title || ""));
-    const outro = chapters.find(c => /outro|ending/i.test(c.title || ""));
-    const headers = raw?.headers || {};
-    
-    results.push({
-      provider,
-      url: streamUrls[0],
-      urls: streamUrls,
-      quality: sources[0]?.quality || "auto",
-      isHardSub: false,
-      subs,
-      intro: intro ? { start: intro.start, end: intro.end } : undefined,
-      outro: outro ? { start: outro.start, end: outro.end } : undefined,
-      headers: Object.keys(headers).length ? headers : undefined,
-    });
+  for (const resp of responses) {
+    if (!resp) continue;
+    const { raw, provider, category: cat } = resp;
+    const normalized = miruroNormalizeStreams(raw, provider);
+    if (normalized) out[cat].push(normalized);
   }
   
-  setCache(ck, results);
-  return results;
+  setCache(ck, out);
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1276,7 +1435,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.5.0", providers: ["anidap", "kaa", "mkissa", "miruro"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.6.0", providers: ["anidap", "kaa", "mkissa", "miruro"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -1336,15 +1495,18 @@ app.get("/mkissa/watch/:anilistId/:audio/:ep", async (req, res) => { try { res.j
 
 // ─── MIRURO ROUTES ────────────────────────────────────────────────────────────
 app.get("/miruro/episodes/:anilistId", async (req, res) => { try { res.json(await miruroEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/miruro/servers/:anilistId/:ep", async (req, res) => { try { res.json(await miruroServers(+req.params.anilistId, +req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/miruro/sources", async (req, res) => {
   try {
     const { episodeId, provider, anilistId, category } = req.query;
     if (!episodeId || !provider || !anilistId) return res.status(400).json({ error: "Missing episodeId, provider, or anilistId" });
-    res.json(await miruroSources(episodeId, provider, +anilistId, category || "sub"));
+    const raw = await miruroSources(episodeId, provider, +anilistId, category || "sub");
+    const normalized = miruroNormalizeStreams(raw, provider);
+    res.json(normalized || raw);
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 app.get("/miruro/all-sources/:anilistId/:ep", async (req, res) => {
-  try { res.json(await miruroAllSources(+req.params.anilistId, +req.params.ep, req.query.category || "sub")); }
+  try { res.json(await miruroAllSources(+req.params.anilistId, +req.params.ep)); }
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 
@@ -1385,11 +1547,13 @@ process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err?.message || err); });
 
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v7.5 on :${PORT}`);
+  console.log(`LuffyTV API v7.6 on :${PORT}`);
   console.log(`  Anidap: ${AN_API} + ${AN_REST}`);
   console.log(`  KAA:    ${KAA_BASE}`);
   console.log(`  MKissa: ${MK_REFERER} → ${MK_API}`);
-  console.log(`  Miruro: ${MIRURO_PIPE}`);
+  console.log(`  Miruro: ${MIRURO_PIPE} (proxy-required)`);
   // Warm up MKissa crypto config
   mkDiscoverCryptoConfig().then(c => console.log(`[MKissa] Crypto config warmed up: buildId=${c.buildId}`)).catch(e => console.warn(`[MKissa] Crypto warmup failed: ${e.message}`));
+  // Warm up Miruro session
+  miruroWarmUp().catch(e => console.warn(`[Miruro] Warm-up failed: ${e.message}`));
 });

@@ -1,7 +1,7 @@
 {
   "name": "luffytv-miruro-api",
-  "version": "7.5.0",
-  "description": "LuffyTV API — Anidap + KAA + MKissa providers, AniList ID routing (no slug needed), HLS proxy, m3u8/mp4 sources",
+  "version": "7.6.0",
+  "description": "LuffyTV API — Anidap + KAA + MKissa + Miruro providers, AniList ID routing, proxy Cloudflare bypass, HLS proxy, m3u8/mp4 sources",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,7 +11,8 @@
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "express": "^4.21.0",
-    "got-scraping": "^4.2.1"
+    "got-scraping": "^4.2.1",
+    "tough-cookie": "^6.0.2"
   },
   "type": "module",
   "engines": {
