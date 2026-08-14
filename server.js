@@ -108,6 +108,24 @@ const AN_HEADERS = {
 };
 const anThrottle = new Throttler(4);
 
+// ─── Proxy Pool for Cloudflare bypass ──────────────────────────────────────
+const PROXY_POOL = [
+  "http://bvmbsmie:shibby2511@us4.cactussstp.com:81",
+  "http://bvmbsmie:shibby2511@us6.cactussstp.com:81",
+  "http://bvmbsmie:shibby2511@au1.cactussstp.com:81",
+  "http://bvmbsmie:shibby2511@it1.cactussstp.com:81",
+  "http://bvmbsmie:shibby2511@in1.cactussstp.com:81",
+  "http://bvmbsmie:shibby2511@my1.cactussstp.com:81",
+  "http://bvmbsmie:shibby2511@uk3.cactussstp.com:81",
+  "http://bvmbsmie:shibby2511@pt1.cactussstp.com:81",
+  "http://bvmbsmie:shibby2511@ro1.cactussstp.com:81",
+  "http://uncpjndo:w77Ebc0h2A@us4.cactussstp.com:81",
+  "http://uncpjndo:w77Ebc0h2A@it1.cactussstp.com:81",
+  "http://hughmuir2:lisamarie11@us4.cactussstp.com:81",
+];
+let proxyIdx = 0;
+function nextProxy() { const p = PROXY_POOL[proxyIdx % PROXY_POOL.length]; proxyIdx++; return p; }
+
 async function anFetch(url, retries = 2) {
   for (let i = 0; i <= retries; i++) {
     await anThrottle.acquire();
@@ -128,21 +146,24 @@ async function anFetch(url, retries = 2) {
   throw new Error(`Anidap fetch failed: ${url}`);
 }
 
-// Chad API — try regular fetch() first (fast), fall back to got-scraping (browser TLS) if Cloudflare blocks
+// Chad API — try regular fetch() first (fast), fall back to rotating proxy via got-scraping if Cloudflare blocks
 async function anChadFetch(path, retries = 1) {
   const url = `${AN_REST}${path}`;
   for (let i = 0; i <= retries; i++) {
     await anThrottle.acquire();
     try {
-      // Try regular fetch first (much faster)
+      // Try regular fetch first (much faster, works on non-datacenter IPs)
       const r = await fetch(url, { headers: AN_HEADERS, signal: AbortSignal.timeout(15000) });
       if (r.status === 403 || r.status === 503) {
-        // Cloudflare blocked — fall back to got-scraping (browser TLS fingerprint)
-        console.warn(`[Anidap/Chad] fetch got HTTP ${r.status}, falling back to got-scraping`);
+        // Cloudflare blocked — use rotating proxy pool via got-scraping
+        const proxy = nextProxy();
+        console.warn(`[Anidap/Chad] fetch got HTTP ${r.status}, retrying via proxy ${proxy.replace(/\/\/[^@]+@/, "//***@")}`);
         const gr = await gotScraping(url, {
           headers: { ...AN_HEADERS, Accept: "application/json" },
           timeout: { request: 15000 },
           followRedirect: true,
+          agent: { http: undefined, https: undefined },
+          proxyUrl: proxy,
         });
         if (gr.statusCode === 429) {
           let j = {}; try { j = JSON.parse(gr.body); } catch {}
@@ -326,9 +347,10 @@ async function kaaFetch(url, opts = {}) {
     if (opts.body) fetchOpts.body = opts.body;
     const r = await fetch(url, fetchOpts);
     if (r.status === 403 || r.status === 503) {
-      // Cloudflare blocked — fall back to got-scraping
-      console.warn(`[KAA] fetch got HTTP ${r.status}, falling back to got-scraping`);
-      const gotOpts = { method, headers: { ...KAA_H, ...opts.headers }, timeout: { request: 15000 }, followRedirect: true };
+      // Cloudflare blocked — use rotating proxy pool
+      const proxy = nextProxy();
+      console.warn(`[KAA] fetch got HTTP ${r.status}, retrying via proxy ${proxy.replace(/\/\/[^@]+@/, "//***@")}`);
+      const gotOpts = { method, headers: { ...KAA_H, ...opts.headers }, timeout: { request: 15000 }, followRedirect: true, agent: { http: undefined, https: undefined }, proxyUrl: proxy };
       if (opts.body) gotOpts.body = opts.body;
       const gr = await gotScraping(url, gotOpts);
       if (gr.statusCode >= 400) throw new Error(`KAA HTTP ${gr.statusCode}: ${url}`);
@@ -1016,7 +1038,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.2.1", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.3.0", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
