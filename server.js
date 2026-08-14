@@ -13,6 +13,7 @@ import express from "express";
 import cors from "cors";
 import compression from "compression";
 import crypto from "node:crypto";
+import { gotScraping } from "got-scraping";
 
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);  // 1hr default
@@ -127,13 +128,32 @@ async function anFetch(url, retries = 2) {
   throw new Error(`Anidap fetch failed: ${url}`);
 }
 
-// Chad API — regular fetch() with browser headers (Cloudflare bypasses without got-scraping)
+// Chad API — try regular fetch() first (fast), fall back to got-scraping (browser TLS) if Cloudflare blocks
 async function anChadFetch(path, retries = 1) {
   const url = `${AN_REST}${path}`;
   for (let i = 0; i <= retries; i++) {
     await anThrottle.acquire();
     try {
+      // Try regular fetch first (much faster)
       const r = await fetch(url, { headers: AN_HEADERS, signal: AbortSignal.timeout(15000) });
+      if (r.status === 403 || r.status === 503) {
+        // Cloudflare blocked — fall back to got-scraping (browser TLS fingerprint)
+        console.warn(`[Anidap/Chad] fetch got HTTP ${r.status}, falling back to got-scraping`);
+        const gr = await gotScraping(url, {
+          headers: { ...AN_HEADERS, Accept: "application/json" },
+          timeout: { request: 15000 },
+          followRedirect: true,
+        });
+        if (gr.statusCode === 429) {
+          let j = {}; try { j = JSON.parse(gr.body); } catch {}
+          const wait = j.retry_after ? Math.min(j.retry_after * 1000, 30000) : 5000;
+          console.warn(`[Anidap/Chad] 429, waiting ${wait}ms`);
+          await new Promise(r => setTimeout(r, wait));
+          continue;
+        }
+        if (gr.statusCode >= 400) throw new Error(`HTTP ${gr.statusCode}`);
+        return JSON.parse(gr.body);
+      }
       if (r.status === 429) {
         const j = await r.json().catch(() => ({}));
         const wait = j.retry_after ? Math.min(j.retry_after * 1000, 30000) : 5000;
@@ -305,6 +325,15 @@ async function kaaFetch(url, opts = {}) {
     };
     if (opts.body) fetchOpts.body = opts.body;
     const r = await fetch(url, fetchOpts);
+    if (r.status === 403 || r.status === 503) {
+      // Cloudflare blocked — fall back to got-scraping
+      console.warn(`[KAA] fetch got HTTP ${r.status}, falling back to got-scraping`);
+      const gotOpts = { method, headers: { ...KAA_H, ...opts.headers }, timeout: { request: 15000 }, followRedirect: true };
+      if (opts.body) gotOpts.body = opts.body;
+      const gr = await gotScraping(url, gotOpts);
+      if (gr.statusCode >= 400) throw new Error(`KAA HTTP ${gr.statusCode}: ${url}`);
+      return JSON.parse(gr.body);
+    }
     if (!r.ok) throw new Error(`KAA HTTP ${r.status}: ${url}`);
     return await r.json();
   } finally { kaaThrottle.release(); }
@@ -987,7 +1016,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.2.0", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.2.1", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
