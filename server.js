@@ -1,10 +1,10 @@
 /**
- * LuffyTV Miruro API — Combined Server v6.0
+ * LuffyTV Miruro API — Combined Server v6.1
  *
  * THREE providers running in parallel:
- *   - /animex/*  — animex.one (pp.animex.one + chad.anidap.lol fallback, 429 retry)
- *   - /mkissa/*  — mkissa.to (encrypted API, multi-embed extractor, m3u8/mp4)
+ *   - /anidap/*  — anidap.lol (GraphQL search + chad.anidap.lol REST for episodes/sources)
  *   - /kaa/*     — kaa.lt (fsearch API, episode servers, HLS via krussdomi)
+ *   - /mkissa/*  — mkissa.to (encrypted API, multi-embed extractor, m3u8/mp4)
  *
  * Unified routes (/search, /anilist/:id/episodes) try ALL providers.
  */
@@ -93,72 +93,107 @@ function episodeMetaFromAnizip(num, anizip) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  ANIMEX PROVIDER
+//  ANIDAP PROVIDER  —  anidap.lol (GraphQL search + chad.anidap.lol REST)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const AX_GQL = "https://graphql.animex.one/graphql";
-const AX_REST = ["https://pp.animex.one/rest/api", "https://chad.anidap.lol/rest/api"];
-const AX_HEADERS = {
+const AN_GQL   = "https://graphql.animex.one/graphql";
+const AN_REST  = "https://chad.anidap.lol/rest/api";
+const AN_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-  "Origin": "https://animex.one",
-  "Referer": "https://animex.one/",
+  "Origin": "https://anidap.lol",
+  "Referer": "https://anidap.lol/",
 };
-const axThrottle = new Throttler(3);
+const anThrottle = new Throttler(4);
 
-async function axGql(query, variables = {}) {
-  await axThrottle.acquire();
+async function anGql(query, variables = {}) {
+  await anThrottle.acquire();
   try {
-    const r = await fetch(AX_GQL, { method: "POST", headers: { "Content-Type": "application/json", ...AX_HEADERS }, body: JSON.stringify({ query, variables }) });
+    const r = await fetch(AN_GQL, { method: "POST", headers: { "Content-Type": "application/json", ...AN_HEADERS }, body: JSON.stringify({ query, variables }) });
     if (!r.ok) throw new Error(`GQL ${r.status}`);
     const j = await r.json();
     if (j.errors?.length) throw new Error(j.errors[0].message);
     return j.data;
-  } finally { axThrottle.release(); }
+  } finally { anThrottle.release(); }
 }
 
-async function axRest(path, retries = 2) {
-  for (const base of AX_REST) {
-    for (let i = 0; i <= retries; i++) {
-      await axThrottle.acquire();
-      try {
-        const r = await fetch(`${base}${path}`, { headers: AX_HEADERS, signal: AbortSignal.timeout(15000) });
-        if (r.status === 429) { const j = await r.json().catch(() => ({})); const wait = j.retry_after ? Math.min(j.retry_after * 1000, 30000) : 5000; console.warn(`[Animex] 429 from ${base}, waiting ${wait}ms`); await new Promise(r => setTimeout(r, wait)); continue; }
-        if (!r.ok) throw new Error(`REST ${r.status}`);
-        return await r.json();
-      } catch (e) { if (i === retries) console.warn(`[Animex] ${base}${path} failed: ${e.message}`); }
-      finally { axThrottle.release(); }
-    }
+async function anRest(path, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    await anThrottle.acquire();
+    try {
+      const r = await fetch(`${AN_REST}${path}`, { headers: { ...AN_HEADERS, Accept: "application/json" }, signal: AbortSignal.timeout(15000) });
+      if (r.status === 429) {
+        const j = await r.json().catch(() => ({}));
+        const wait = j.retry_after ? Math.min(j.retry_after * 1000, 30000) : 5000;
+        console.warn(`[Anidap] 429, waiting ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      if (!r.ok) throw new Error(`REST ${r.status}`);
+      return await r.json();
+    } catch (e) { if (i === retries) console.warn(`[Anidap] ${AN_REST}${path} failed: ${e.message}`); }
+    finally { anThrottle.release(); }
   }
-  throw new Error("All animex REST endpoints failed");
+  throw new Error(`Anidap REST failed: ${path}`);
 }
 
-async function axSearch(q) {
-  const d = await axGql(`query($q:String!){searchAnime(query:$q){items{id anilistId titleRomaji titleEnglish coverImage format episodeCount status}}}`, { q });
-  return (d.searchAnime?.items || []).map(a => ({ id: a.id, slug: a.id, title: a.titleRomaji || a.titleEnglish, image: typeof a.coverImage === "string" ? a.coverImage : a.coverImage?.large || a.coverImage?.medium, type: a.format, episodes: a.episodeCount, status: a.status }));
-}
-
-async function axAnilistToSlug(alId) {
-  const d = await axGql(`query($id:Int!){anime(anilistId:$id){id anilistId titleRomaji titleEnglish coverImage}}`, { id: alId });
-  if (!d.anime) return null;
-  return { id: d.anime.id, slug: d.anime.id, title: d.anime.titleRomaji || d.anime.titleEnglish, image: typeof d.anime.coverImage === "string" ? d.anime.coverImage : d.anime.coverImage?.large };
-}
-
-async function axEpisodes(slug) {
-  const d = await axRest(`/episodes?id=${slug}`);
-  const eps = Array.isArray(d) ? d : (d?.episodes || d?.data || []);
-  return eps.map((e, i) => ({ number: e.number ?? (i + 1), title: e.titles?.en || e.title || `Episode ${e.number ?? (i + 1)}`, slug: e.slug || e.id || String(e.number ?? (i + 1)), img: e.img, isFiller: e.isFiller, description: e.description }));
-}
-
-async function axSource(slug, ep, providerId = "gogoanime", subType = "sub") {
-  const d = await axRest(`/sources?providerId=${providerId}&id=${slug}&epNum=${ep}&subType=${subType}`);
-  const srcs = Array.isArray(d) ? d : (d?.sources || d?.data || []);
-  return srcs.map(s => ({
-    url: s.url || s.file,
-    type: s.type?.includes("mpegurl") ? "m3u8" : (s.type || (s.url?.includes(".m3u8") ? "m3u8" : "mp4")),
-    quality: s.quality || s.resolution || "auto",
-    server: s.server || providerId,
-    headers: d?.headers || {},
+async function anSearch(q) {
+  const d = await anGql(`query($q:String!){searchAnime(query:$q){items{id anilistId titleRomaji titleEnglish coverImage format episodeCount status}}}`, { q });
+  return (d.searchAnime?.items || []).map(a => ({
+    id: a.id, slug: a.id, title: a.titleRomaji || a.titleEnglish,
+    image: typeof a.coverImage === "string" ? a.coverImage : a.coverImage?.large || a.coverImage?.medium,
+    type: a.format, episodes: a.episodeCount, status: a.status,
   }));
+}
+
+async function anAnilistToSlug(alId) {
+  const d = await anGql(`query($id:Int!){anime(anilistId:$id){id anilistId titleRomaji titleEnglish coverImage}}`, { id: alId });
+  if (!d.anime) return null;
+  return {
+    id: d.anime.id, slug: d.anime.id,
+    title: d.anime.titleRomaji || d.anime.titleEnglish,
+    image: typeof d.anime.coverImage === "string" ? d.anime.coverImage : d.anime.coverImage?.large,
+  };
+}
+
+async function anEpisodes(slug) {
+  const d = await anRest(`/episodes?id=${slug}`);
+  const eps = Array.isArray(d) ? d : (d?.data || []);
+  return eps.map((e, i) => ({
+    number: e.number ?? (i + 1),
+    title: e.titles?.en || e.title || `Episode ${e.number ?? (i + 1)}`,
+    slug: e.slug || e.id || String(e.number ?? (i + 1)),
+    img: e.img, isFiller: e.isFiller, description: e.description,
+  }));
+}
+
+async function anServers(slug, ep) {
+  const d = await anRest(`/servers?id=${slug}&epNum=${ep}`);
+  const sub = Array.isArray(d?.subProviders) ? d.subProviders : [];
+  const dub = Array.isArray(d?.dubProviders) ? d.dubProviders : [];
+  const norm = p => typeof p === "string" ? { id: p } : { id: p.id, type: p.type, default: p.default, tip: p.tip };
+  return { sub: sub.map(norm), dub: dub.map(norm) };
+}
+
+async function anSource(slug, ep, providerId = "beep", type = "sub") {
+  const d = await anRest(`/sources?id=${slug}&epNum=${ep}&providerId=${providerId}&type=${type}`);
+  const payload = d?.data && typeof d.data === "object" && !Array.isArray(d.data) ? d.data : d;
+  const sources = Array.isArray(payload?.sources) ? payload.sources : [];
+  const tracks  = Array.isArray(payload?.tracks) ? payload.tracks : [];
+  const chapters = Array.isArray(payload?.chapters) ? payload.chapters : [];
+  const headers = payload?.headers || {};
+  return {
+    sources: sources.map(s => ({
+      url: s.url || s.file,
+      type: s.type?.includes("mpegurl") ? "m3u8" : (s.type || (s.url?.includes(".m3u8") ? "m3u8" : "mp4")),
+      quality: s.quality || s.resolution || "auto",
+      server: providerId,
+      headers,
+    })),
+    tracks,
+    chapters,
+    intro: chapters.find(c => /intro/i.test(c.title)) || payload?.intro,
+    outro: chapters.find(c => /outro|ed\b|ending/i.test(c.title)) || payload?.outro,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -864,16 +899,17 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "6.0.0", providers: ["animex", "kaa", "mkissa"], mkissaCrypto: mkCryptoConfigCache ? `ok (buildId: ${mkCryptoConfigCache.buildId})` : "pending" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "6.1.0", providers: ["anidap", "kaa", "mkissa"], mkissaCrypto: mkCryptoConfigCache ? `ok (buildId: ${mkCryptoConfigCache.buildId})` : "pending" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
 
-// ─── ANIMEX ROUTES ────────────────────────────────────────────────────────────
-app.get("/animex/search", async (req, res) => { try { res.json(await axSearch(req.query.q)); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.get("/animex/anilist/:id", async (req, res) => { try { const r = await axAnilistToSlug(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found" }); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.get("/animex/episodes/:slug", async (req, res) => { try { res.json(await axEpisodes(req.params.slug)); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.get("/animex/sources/:slug/:ep", async (req, res) => { try { res.json(await axSource(req.params.slug, req.params.ep, req.query.provider || "gogoanime", req.query.subType || "sub")); } catch (e) { res.status(502).json({ error: e.message }); } });
+// ─── ANIDAP ROUTES ────────────────────────────────────────────────────────────
+app.get("/anidap/search", async (req, res) => { try { res.json(await anSearch(req.query.q)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/anidap/anilist/:id", async (req, res) => { try { const r = await anAnilistToSlug(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found" }); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/anidap/episodes/:slug", async (req, res) => { try { res.json(await anEpisodes(req.params.slug)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/anidap/servers/:slug/:ep", async (req, res) => { try { res.json(await anServers(req.params.slug, req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/anidap/sources/:slug/:ep", async (req, res) => { try { res.json(await anSource(req.params.slug, req.params.ep, req.query.provider || "beep", req.query.type || "sub")); } catch (e) { res.status(502).json({ error: e.message }); } });
 
 // ─── KAA ROUTES ──────────────────────────────────────────────────────────────
 app.get("/kaa/search", async (req, res) => { try { const results = await kaaSearch(req.query.q || ""); res.json(results); } catch (e) { res.status(502).json({ error: e.message }); } });
@@ -888,16 +924,16 @@ app.get("/mkissa/watch/:anilistId/:audio/:ep", async (req, res) => { try { res.j
 // ─── UNIFIED ROUTES ───────────────────────────────────────────────────────────
 app.get("/search", async (req, res) => {
   const q = req.query.q; if (!q) return res.status(400).json({ error: "Missing ?q=" });
-  const results = { animex: [], kaa: [], mkissa: [] };
-  try { results.animex = await axSearch(q); } catch (e) { results.animex = { error: e.message }; }
+  const results = { anidap: [], kaa: [], mkissa: [] };
+  try { results.anidap = await anSearch(q); } catch (e) { results.anidap = { error: e.message }; }
   try { results.kaa = await kaaSearch(q); } catch (e) { results.kaa = { error: e.message }; }
   try { results.mkissa = await mkSearch(q); } catch (e) { results.mkissa = { error: e.message }; }
   res.json(results);
 });
 
 app.get("/anilist/:id/episodes", async (req, res) => {
-  const id = +req.params.id; const result = { animex: null, kaa: null, mkissa: null };
-  try { const m = await axAnilistToSlug(id); if (m) result.animex = { anime: m, episodes: await axEpisodes(m.slug) }; } catch (e) { result.animex = { error: e.message }; }
+  const id = +req.params.id; const result = { anidap: null, kaa: null, mkissa: null };
+  try { const m = await anAnilistToSlug(id); if (m) result.anidap = { anime: m, episodes: await anEpisodes(m.slug) }; } catch (e) { result.anidap = { error: e.message }; }
   try { result.kaa = await kaaGetEpisodes(id); } catch (e) { result.kaa = { error: e.message }; }
   try { result.mkissa = await mkHandleEpisodes(id); } catch (e) { result.mkissa = { error: e.message }; }
   res.json(result);
@@ -908,8 +944,8 @@ process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err?.message || err); });
 
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v6.0 on :${PORT}`);
-  console.log(`  Animex: ${AX_GQL} + ${AX_REST.join(", ")}`);
+  console.log(`LuffyTV API v6.1 on :${PORT}`);
+  console.log(`  Anidap: ${AN_GQL} + ${AN_REST}`);
   console.log(`  KAA:    ${KAA_BASE}`);
   console.log(`  MKissa: ${MK_REFERER} → ${MK_API}`);
   // Warm up MKissa crypto config
