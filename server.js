@@ -1,8 +1,8 @@
 /**
- * LuffyTV Miruro API — Combined Server v6.1
+ * LuffyTV Miruro API — Combined Server v7.0
  *
  * THREE providers running in parallel:
- *   - /anidap/*  — anidap.lol (GraphQL search + chad.anidap.lol REST for episodes/sources)
+ *   - /anidap/*  — anidap.lol (native API: search + AniList ID lookup + chad.anidap.lol REST)
  *   - /kaa/*     — kaa.lt (fsearch API, episode servers, HLS via krussdomi)
  *   - /mkissa/*  — mkissa.to (encrypted API, multi-embed extractor, m3u8/mp4)
  *
@@ -93,34 +93,24 @@ function episodeMetaFromAnizip(num, anizip) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  ANIDAP PROVIDER  —  anidap.lol (GraphQL search + chad.anidap.lol REST)
+//  ANIDAP PROVIDER  —  anidap.lol native API + chad.anidap.lol REST
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const AN_GQL   = "https://graphql.animex.one/graphql";
-const AN_REST  = "https://chad.anidap.lol/rest/api";
+const AN_API   = "https://anidap.lol/api/anime";    // Main API (search, details by AniList ID)
+const AN_REST  = "https://chad.anidap.lol/rest/api"; // Chad API (episodes, servers, sources)
 const AN_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept": "application/json",
   "Origin": "https://anidap.lol",
   "Referer": "https://anidap.lol/",
 };
 const anThrottle = new Throttler(4);
 
-async function anGql(query, variables = {}) {
-  await anThrottle.acquire();
-  try {
-    const r = await fetch(AN_GQL, { method: "POST", headers: { "Content-Type": "application/json", ...AN_HEADERS }, body: JSON.stringify({ query, variables }) });
-    if (!r.ok) throw new Error(`GQL ${r.status}`);
-    const j = await r.json();
-    if (j.errors?.length) throw new Error(j.errors[0].message);
-    return j.data;
-  } finally { anThrottle.release(); }
-}
-
-async function anRest(path, retries = 2) {
+async function anFetch(url, retries = 2) {
   for (let i = 0; i <= retries; i++) {
     await anThrottle.acquire();
     try {
-      const r = await fetch(`${AN_REST}${path}`, { headers: { ...AN_HEADERS, Accept: "application/json" }, signal: AbortSignal.timeout(15000) });
+      const r = await fetch(url, { headers: AN_HEADERS, signal: AbortSignal.timeout(15000) });
       if (r.status === 429) {
         const j = await r.json().catch(() => ({}));
         const wait = j.retry_after ? Math.min(j.retry_after * 1000, 30000) : 5000;
@@ -128,54 +118,187 @@ async function anRest(path, retries = 2) {
         await new Promise(r => setTimeout(r, wait));
         continue;
       }
-      if (!r.ok) throw new Error(`REST ${r.status}`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return await r.json();
-    } catch (e) { if (i === retries) console.warn(`[Anidap] ${AN_REST}${path} failed: ${e.message}`); }
+    } catch (e) { if (i === retries) console.warn(`[Anidap] ${url} failed: ${e.message}`); }
     finally { anThrottle.release(); }
   }
-  throw new Error(`Anidap REST failed: ${path}`);
+  throw new Error(`Anidap fetch failed: ${url}`);
 }
 
+// Chad API uses got-scraping (browser TLS fingerprint) to bypass Cloudflare
+async function anChadFetch(path, retries = 2) {
+  const url = `${AN_REST}${path}`;
+  for (let i = 0; i <= retries; i++) {
+    await anThrottle.acquire();
+    try {
+      const r = await gotScraping(url, {
+        headers: { ...AN_HEADERS, Accept: "application/json" },
+        timeout: { request: 15000 },
+        followRedirect: true,
+      });
+      if (r.statusCode === 429) {
+        let j = {};
+        try { j = JSON.parse(r.body); } catch {}
+        const wait = j.retry_after ? Math.min(j.retry_after * 1000, 30000) : 5000;
+        console.warn(`[Anidap/Chad] 429, waiting ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      return JSON.parse(r.body);
+    } catch (e) { if (i === retries) console.warn(`[Anidap/Chad] ${url} failed: ${e.message}`); }
+    finally { anThrottle.release(); }
+  }
+  throw new Error(`Anidap Chad fetch failed: ${path}`);
+}
+
+// Search via anidap.lol native API
 async function anSearch(q) {
-  const d = await anGql(`query($q:String!){searchAnime(query:$q){items{id anilistId titleRomaji titleEnglish coverImage format episodeCount status}}}`, { q });
-  return (d.searchAnime?.items || []).map(a => ({
-    id: a.id, slug: a.id, title: a.titleRomaji || a.titleEnglish,
-    image: typeof a.coverImage === "string" ? a.coverImage : a.coverImage?.large || a.coverImage?.medium,
-    type: a.format, episodes: a.episodeCount, status: a.status,
+  const d = await anFetch(`${AN_API}/search?q=${encodeURIComponent(q)}`);
+  const results = Array.isArray(d?.results) ? d.results : [];
+  return results.map(a => ({
+    id: a.id,                   // AniList ID from search results
+    anilistId: a.id,           // explicit AniList ID
+    title: a.title?.userPreferred || a.title?.english || a.title?.romaji,
+    image: a.image,
+    type: a.type,              // TV, MOVIE, OVA, etc.
+    episodes: a.totalEpisodes || a.episodes,
+    status: a.status,
+    rating: a.rating,
+    genres: a.genres,
+    releaseDate: a.releaseDate,
   }));
 }
 
+// AniList ID → slug + metadata
+// anidap.lol has its own AniList IDs that may differ from official AniList.
+// Strategy: try direct ID lookup first (fast, works when IDs match),
+// then fall back to title search via AniList + ani.zip if that fails.
 async function anAnilistToSlug(alId) {
-  const d = await anGql(`query($id:Int!){anime(anilistId:$id){id anilistId titleRomaji titleEnglish coverImage}}`, { id: alId });
-  if (!d.anime) return null;
-  return {
-    id: d.anime.id, slug: d.anime.id,
-    title: d.anime.titleRomaji || d.anime.titleEnglish,
-    image: typeof d.anime.coverImage === "string" ? d.anime.coverImage : d.anime.coverImage?.large,
-  };
+  const ck = `an-resolve:${alId}`;
+  const c = getCached(ck); if (c) return c;
+
+  // Step 1: Try direct ID lookup (works when anidap's ID matches official AniList)
+  try {
+    const raw = await anFetch(`${AN_API}/${alId}`);
+    const d = raw?.data && typeof raw.data === "object" ? raw.data : raw;
+    if (d?.id && d?.anilistId) {
+      const result = {
+        id: d.id,
+        slug: d.id,
+        anilistId: d.anilistId || alId,
+        malId: d.malId,
+        title: d.titleEnglish || d.titleRomaji || d.titles?.en || d.titles?.romaji,
+        titleRomaji: d.titleRomaji,
+        titleEnglish: d.titleEnglish,
+        image: d.coverImage?.extraLarge || d.coverImage?.large || (typeof d.coverImage === "string" ? d.coverImage : null),
+        bannerImage: d.bannerImage,
+        episodeCount: d.episodeCount,
+        genres: d.genres,
+        status: d.status,
+        type: d.type,
+      };
+      setCache(ck, result);
+      return result;
+    }
+  } catch (e) {
+    console.warn(`[Anidap] Direct ID lookup for ${alId} failed: ${e.message}, trying search fallback`);
+  }
+
+  // Step 2: Fallback — fetch title from AniList/ani.zip, search on anidap, find best match
+  try {
+    const [media, anizip] = await Promise.all([fetchAniListMedia(alId), fetchAniZip(alId)]);
+    if (!media) return null;
+    const titles = buildTitles(media, anizip);
+    if (!titles.length) return null;
+
+    // Search anidap with first usable title
+    for (const title of titles.slice(0, 3)) {
+      if (/[\u3000-\u9fff\u4e00-\u9faf]/.test(title)) continue; // skip CJK
+      const searchResults = await anSearch(title);
+      if (!searchResults.length) continue;
+
+      // Find best match by year + title similarity
+      const targetYear = media?.seasonYear || media?.startDate?.year;
+      let best = null, bestScore = -1;
+      for (const r of searchResults) {
+        let score = diceCoeff(titles[0], r.title || "");
+        // Year bonus
+        if (targetYear && r.releaseDate && r.releaseDate === targetYear) score += 0.15;
+        // Type bonus
+        const af = (media?.format || "").toUpperCase();
+        const rf = (r.type || "").toUpperCase();
+        if (af === "MOVIE" && rf === "MOVIE") score += 0.1;
+        else if (af === "TV" && rf === "TV") score += 0.1;
+        if (score > bestScore) { bestScore = score; best = r; }
+      }
+
+      if (best && bestScore >= 0.5) {
+        // Now resolve the matched anidap ID to get the slug
+        const raw2 = await anFetch(`${AN_API}/${best.id}`);
+        const d2 = raw2?.data && typeof raw2.data === "object" ? raw2.data : raw2;
+        if (d2?.id) {
+          const result = {
+            id: d2.id,
+            slug: d2.id,
+            anilistId: d2.anilistId || alId,
+            malId: d2.malId,
+            title: d2.titleEnglish || d2.titleRomaji || d2.titles?.en || d2.titles?.romaji,
+            titleRomaji: d2.titleRomaji,
+            titleEnglish: d2.titleEnglish,
+            image: d2.coverImage?.extraLarge || d2.coverImage?.large || (typeof d2.coverImage === "string" ? d2.coverImage : null),
+            bannerImage: d2.bannerImage,
+            episodeCount: d2.episodeCount,
+            genres: d2.genres,
+            status: d2.status,
+            type: d2.type,
+          };
+          setCache(ck, result);
+          return result;
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`[Anidap] Search fallback for AniList ${alId} failed: ${e.message}`);
+  }
+
+  return null;
 }
 
+// Episodes via chad.anidap.lol REST (needs slug)
 async function anEpisodes(slug) {
-  const d = await anRest(`/episodes?id=${slug}`);
+  const ck = `an-eps:${slug}`;
+  const c = getCached(ck); if (c) return c;
+  const d = await anChadFetch(`/episodes?id=${encodeURIComponent(slug)}`);
   const eps = Array.isArray(d) ? d : (d?.data || []);
-  return eps.map((e, i) => ({
+  const result = eps.map((e, i) => ({
     number: e.number ?? (i + 1),
     title: e.titles?.en || e.title || `Episode ${e.number ?? (i + 1)}`,
-    slug: e.slug || e.id || String(e.number ?? (i + 1)),
-    img: e.img, isFiller: e.isFiller, description: e.description,
+    img: e.img,
+    isFiller: e.isFiller,
+    description: e.description,
+    airDate: e.airDateUtc,
+    hasSub: e.hasSub,
+    hasDub: e.hasDub,
+    duration: e.length,
+    rating: e.rating,
   }));
+  setCache(ck, result);
+  return result;
 }
 
+// Servers via chad.anidap.lol REST
 async function anServers(slug, ep) {
-  const d = await anRest(`/servers?id=${slug}&epNum=${ep}`);
+  const d = await anChadFetch(`/servers?id=${encodeURIComponent(slug)}&epNum=${ep}`);
   const sub = Array.isArray(d?.subProviders) ? d.subProviders : [];
   const dub = Array.isArray(d?.dubProviders) ? d.dubProviders : [];
   const norm = p => typeof p === "string" ? { id: p } : { id: p.id, type: p.type, default: p.default, tip: p.tip };
   return { sub: sub.map(norm), dub: dub.map(norm) };
 }
 
+// Source via chad.anidap.lol REST
 async function anSource(slug, ep, providerId = "beep", type = "sub") {
-  const d = await anRest(`/sources?id=${slug}&epNum=${ep}&providerId=${providerId}&type=${type}`);
+  const d = await anChadFetch(`/sources?id=${encodeURIComponent(slug)}&epNum=${ep}&providerId=${providerId}&type=${type}`);
   const payload = d?.data && typeof d.data === "object" && !Array.isArray(d.data) ? d.data : d;
   const sources = Array.isArray(payload?.sources) ? payload.sources : [];
   const tracks  = Array.isArray(payload?.tracks) ? payload.tracks : [];
@@ -899,17 +1022,45 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "6.1.0", providers: ["anidap", "kaa", "mkissa"], mkissaCrypto: mkCryptoConfigCache ? `ok (buildId: ${mkCryptoConfigCache.buildId})` : "pending" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.0.0", providers: ["anidap", "kaa", "mkissa"], anidapApi: AN_API, anidapChad: AN_REST, mkissaCrypto: mkCryptoConfigCache ? `ok (buildId: ${mkCryptoConfigCache.buildId})` : "pending" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
 
 // ─── ANIDAP ROUTES ────────────────────────────────────────────────────────────
+// Direct AniList ID routes — no slug needed!
 app.get("/anidap/search", async (req, res) => { try { res.json(await anSearch(req.query.q)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/anidap/anilist/:id", async (req, res) => { try { const r = await anAnilistToSlug(+req.params.id); r ? res.json(r) : res.status(404).json({ error: "Not found" }); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.get("/anidap/episodes/:slug", async (req, res) => { try { res.json(await anEpisodes(req.params.slug)); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.get("/anidap/servers/:slug/:ep", async (req, res) => { try { res.json(await anServers(req.params.slug, req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
-app.get("/anidap/sources/:slug/:ep", async (req, res) => { try { res.json(await anSource(req.params.slug, req.params.ep, req.query.provider || "beep", req.query.type || "sub")); } catch (e) { res.status(502).json({ error: e.message }); } });
+// Episodes & sources accept EITHER AniList ID or slug
+app.get("/anidap/episodes/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    // If it's a pure number, treat as AniList ID → resolve slug first
+    if (/^\d+$/.test(id)) {
+      const m = await anAnilistToSlug(+id);
+      if (!m) return res.status(404).json({ error: "AniList ID not found" });
+      return res.json({ anime: m, episodes: await anEpisodes(m.slug) });
+    }
+    // Otherwise treat as slug
+    res.json(await anEpisodes(id));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.get("/anidap/servers/:id/:ep", async (req, res) => {
+  try {
+    const id = req.params.id;
+    let slug = id;
+    if (/^\d+$/.test(id)) { const m = await anAnilistToSlug(+id); if (m) slug = m.slug; }
+    res.json(await anServers(slug, req.params.ep));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.get("/anidap/sources/:id/:ep", async (req, res) => {
+  try {
+    const id = req.params.id;
+    let slug = id;
+    if (/^\d+$/.test(id)) { const m = await anAnilistToSlug(+id); if (m) slug = m.slug; }
+    res.json(await anSource(slug, req.params.ep, req.query.provider || "beep", req.query.type || "sub"));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
 
 // ─── KAA ROUTES ──────────────────────────────────────────────────────────────
 app.get("/kaa/search", async (req, res) => { try { const results = await kaaSearch(req.query.q || ""); res.json(results); } catch (e) { res.status(502).json({ error: e.message }); } });
@@ -939,13 +1090,27 @@ app.get("/anilist/:id/episodes", async (req, res) => {
   res.json(result);
 });
 
+// Unified watch — get streams from anidap directly by AniList ID
+app.get("/anilist/:id/watch/:ep", async (req, res) => {
+  const id = +req.params.id;
+  const ep = +req.params.ep;
+  const provider = req.query.provider || "beep";
+  const type = req.query.type || "sub";
+  const result = { anidap: null };
+  try {
+    const m = await anAnilistToSlug(id);
+    if (m) result.anidap = await anSource(m.slug, ep, provider, type);
+  } catch (e) { result.anidap = { error: e.message }; }
+  res.json(result);
+});
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err?.message || err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err?.message || err); });
 
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v6.1 on :${PORT}`);
-  console.log(`  Anidap: ${AN_GQL} + ${AN_REST}`);
+  console.log(`LuffyTV API v7.0 on :${PORT}`);
+  console.log(`  Anidap: ${AN_API} + ${AN_REST}`);
   console.log(`  KAA:    ${KAA_BASE}`);
   console.log(`  MKissa: ${MK_REFERER} → ${MK_API}`);
   // Warm up MKissa crypto config
