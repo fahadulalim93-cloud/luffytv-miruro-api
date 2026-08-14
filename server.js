@@ -325,6 +325,74 @@ async function anSource(slug, ep, providerId = "beep", type = "sub") {
   return { stream, subs };
 }
 
+// All sources — fetch ALL providers in parallel, return full details per provider
+const AN_SUB_PROVIDERS = ["beep", "mimi", "yuki", "neko", "kiwi", "sora"];
+const AN_DUB_PROVIDERS = ["mimi", "yuki", "neko", "kiwi", "sora"];
+
+async function anAllSources(slug, ep) {
+  const ck = `an-allsrc:${slug}:${ep}`;
+  const c = getCached(ck); if (c) return c;
+
+  // Build all fetch tasks: sub + dub — use direct fetch with staggered delays to avoid 429
+  const tasks = [];
+  let delay = 0;
+  for (const p of AN_SUB_PROVIDERS) {
+    tasks.push({ provider: p, type: "sub", delay, promise: (async () => { await new Promise(r => setTimeout(r, delay)); return anChadFetch(`/sources?id=${encodeURIComponent(slug)}&epNum=${ep}&providerId=${p}&type=sub`).catch(() => null); })() });
+    delay += 200; // 200ms stagger between requests
+  }
+  for (const p of AN_DUB_PROVIDERS) {
+    tasks.push({ provider: p, type: "dub", delay, promise: (async () => { await new Promise(r => setTimeout(r, delay)); return anChadFetch(`/sources?id=${encodeURIComponent(slug)}&epNum=${ep}&providerId=${p}&type=dub`).catch(() => null); })() });
+    delay += 200;
+  }
+
+  // Fire all in parallel
+  const results = await Promise.all(tasks.map(t => t.promise));
+  const out = { sub: [], dub: [] };
+
+  for (let i = 0; i < tasks.length; i++) {
+    const { provider, type } = tasks[i];
+    const raw = results[i];
+    if (!raw) continue;
+
+    const payload = raw?.data && typeof raw.data === "object" && !Array.isArray(raw.data) ? raw.data : raw;
+    const sources = Array.isArray(payload?.sources) ? payload.sources : [];
+    const streamUrls = sources.map(s => s.url || s.file).filter(Boolean);
+    if (streamUrls.length === 0) continue; // skip if no stream
+
+    const rawTracks = Array.isArray(payload?.tracks) ? payload.tracks : [];
+    const subs = rawTracks.filter(t => t?.url && (t.kind === "captions" || t.kind === "subtitles"))
+      .map(t => ({ url: t.url, lang: t.lang || t.label || "en", label: t.label || t.lang || "" }));
+
+    // Chapters → intro/outro
+    const chapters = Array.isArray(payload?.chapters) ? payload.chapters : [];
+    const intro = chapters.find(c => /intro/i.test(c.title || ""));
+    const outro = chapters.find(c => /outro|ending/i.test(c.title || ""));
+
+    // Headers (referer needed for some CDNs)
+    const headers = payload?.headers || {};
+
+    // Detect hard sub from provider tip or source type
+    const isHardSub = provider === "neko" || provider === "kiwi";
+
+    const entry = {
+      provider,
+      url: streamUrls[0],  // primary stream
+      urls: streamUrls,     // all qualities if available
+      quality: sources[0]?.quality || "auto",
+      isHardSub,
+      subs,
+      intro: intro ? { start: intro.start, end: intro.end } : undefined,
+      outro: outro ? { start: outro.start, end: outro.end } : undefined,
+      headers: Object.keys(headers).length ? headers : undefined,
+    };
+
+    out[type].push(entry);
+  }
+
+  setCache(ck, out);
+  return out;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  KAA PROVIDER  —  kaa.lt (fsearch + episode servers, HLS via krussdomi)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1038,7 +1106,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.3.0", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.4.0", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -1075,6 +1143,14 @@ app.get("/anidap/sources/:id/:ep", async (req, res) => {
     let slug = id;
     if (/^\d+$/.test(id)) { const m = await anAnilistToSlug(+id); if (m) slug = m.slug; }
     res.json(await anSource(slug, req.params.ep, req.query.provider || "beep", req.query.type || "sub"));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.get("/anidap/all-sources/:id/:ep", async (req, res) => {
+  try {
+    const id = req.params.id;
+    let slug = id;
+    if (/^\d+$/.test(id)) { const m = await anAnilistToSlug(+id); if (m) slug = m.slug; }
+    res.json(await anAllSources(slug, req.params.ep));
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
