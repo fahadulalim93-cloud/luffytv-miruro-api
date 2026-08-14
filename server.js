@@ -277,27 +277,16 @@ async function anServers(slug, ep) {
   return { sub: sub.map(norm), dub: dub.map(norm) };
 }
 
-// Source via chad.anidap.lol REST
+// Source via chad.anidap.lol REST — ONLY stream url + subtitles, nothing else
 async function anSource(slug, ep, providerId = "beep", type = "sub") {
   const d = await anChadFetch(`/sources?id=${encodeURIComponent(slug)}&epNum=${ep}&providerId=${providerId}&type=${type}`);
   const payload = d?.data && typeof d.data === "object" && !Array.isArray(d.data) ? d.data : d;
   const sources = Array.isArray(payload?.sources) ? payload.sources : [];
-  const tracks  = Array.isArray(payload?.tracks) ? payload.tracks : [];
-  const chapters = Array.isArray(payload?.chapters) ? payload.chapters : [];
-  const headers = payload?.headers || {};
-  return {
-    sources: sources.map(s => ({
-      url: s.url || s.file,
-      type: s.type?.includes("mpegurl") ? "m3u8" : (s.type || (s.url?.includes(".m3u8") ? "m3u8" : "mp4")),
-      quality: s.quality || s.resolution || "auto",
-      server: providerId,
-      headers,
-    })),
-    tracks,
-    chapters,
-    intro: chapters.find(c => /intro/i.test(c.title)) || payload?.intro,
-    outro: chapters.find(c => /outro|ed\b|ending/i.test(c.title)) || payload?.outro,
-  };
+  const rawTracks = Array.isArray(payload?.tracks) ? payload.tracks : [];
+  // Only m3u8/mp4 url + VTT subtitle tracks
+  const stream = sources.map(s => s.url || s.file).filter(Boolean);
+  const subs = rawTracks.filter(t => t?.url && (t.kind === "captions" || t.kind === "subtitles")).map(t => ({ url: t.url, lang: t.lang || t.label || "en" }));
+  return { stream, subs };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
