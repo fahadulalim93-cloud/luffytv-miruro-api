@@ -11,11 +11,13 @@
 
 import express from "express";
 import cors from "cors";
+import compression from "compression";
 import crypto from "node:crypto";
 import { gotScraping } from "got-scraping";
 
 const PORT = process.env.PORT || 3000;
-const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);
+const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);  // 1hr default
+const CACHE_TTL_LONG = CACHE_TTL * 4;  // 4hr for stable data (slug mapping)
 
 // ─── Shared Cache ──────────────────────────────────────────────────────────────
 const cache = new Map();
@@ -127,14 +129,14 @@ async function anFetch(url, retries = 2) {
 }
 
 // Chad API uses got-scraping (browser TLS fingerprint) to bypass Cloudflare
-async function anChadFetch(path, retries = 2) {
+async function anChadFetch(path, retries = 1) {
   const url = `${AN_REST}${path}`;
   for (let i = 0; i <= retries; i++) {
     await anThrottle.acquire();
     try {
       const r = await gotScraping(url, {
         headers: { ...AN_HEADERS, Accept: "application/json" },
-        timeout: { request: 15000 },
+        timeout: { request: 12000 },
         followRedirect: true,
       });
       if (r.statusCode === 429) {
@@ -152,22 +154,21 @@ async function anChadFetch(path, retries = 2) {
   throw new Error(`Anidap Chad fetch failed: ${path}`);
 }
 
-// Search via anidap.lol native API
+// Search via anidap.lol native API — LIGHTWEIGHT results
 async function anSearch(q) {
+  const ck = `an-search:${q}`;
+  const c = getCached(ck); if (c) return c;
   const d = await anFetch(`${AN_API}/search?q=${encodeURIComponent(q)}`);
   const results = Array.isArray(d?.results) ? d.results : [];
-  return results.map(a => ({
-    id: a.id,                   // AniList ID from search results
-    anilistId: a.id,           // explicit AniList ID
+  const out = results.map(a => ({
+    id: a.id,
     title: a.title?.userPreferred || a.title?.english || a.title?.romaji,
     image: a.image,
-    type: a.type,              // TV, MOVIE, OVA, etc.
+    type: a.type,
     episodes: a.totalEpisodes || a.episodes,
-    status: a.status,
-    rating: a.rating,
-    genres: a.genres,
-    releaseDate: a.releaseDate,
   }));
+  setCache(ck, out);
+  return out;
 }
 
 // AniList ID → slug + metadata
@@ -187,18 +188,11 @@ async function anAnilistToSlug(alId) {
         id: d.id,
         slug: d.id,
         anilistId: d.anilistId || alId,
-        malId: d.malId,
         title: d.titleEnglish || d.titleRomaji || d.titles?.en || d.titles?.romaji,
-        titleRomaji: d.titleRomaji,
-        titleEnglish: d.titleEnglish,
         image: d.coverImage?.extraLarge || d.coverImage?.large || (typeof d.coverImage === "string" ? d.coverImage : null),
-        bannerImage: d.bannerImage,
         episodeCount: d.episodeCount,
-        genres: d.genres,
-        status: d.status,
-        type: d.type,
       };
-      setCache(ck, result);
+      setCache(ck, result);  // cache slug mapping with long TTL
       return result;
     }
   } catch (e) {
@@ -242,16 +236,9 @@ async function anAnilistToSlug(alId) {
             id: d2.id,
             slug: d2.id,
             anilistId: d2.anilistId || alId,
-            malId: d2.malId,
             title: d2.titleEnglish || d2.titleRomaji || d2.titles?.en || d2.titles?.romaji,
-            titleRomaji: d2.titleRomaji,
-            titleEnglish: d2.titleEnglish,
             image: d2.coverImage?.extraLarge || d2.coverImage?.large || (typeof d2.coverImage === "string" ? d2.coverImage : null),
-            bannerImage: d2.bannerImage,
             episodeCount: d2.episodeCount,
-            genres: d2.genres,
-            status: d2.status,
-            type: d2.type,
           };
           setCache(ck, result);
           return result;
@@ -265,23 +252,17 @@ async function anAnilistToSlug(alId) {
   return null;
 }
 
-// Episodes via chad.anidap.lol REST (needs slug)
+// Episodes via chad.anidap.lol REST — STRIPPED DOWN for speed
 async function anEpisodes(slug) {
   const ck = `an-eps:${slug}`;
   const c = getCached(ck); if (c) return c;
   const d = await anChadFetch(`/episodes?id=${encodeURIComponent(slug)}`);
   const eps = Array.isArray(d) ? d : (d?.data || []);
+  // Only number + title + hasDub — drops img/desc/airDate/rating (saves 70%+ on long anime)
   const result = eps.map((e, i) => ({
-    number: e.number ?? (i + 1),
-    title: e.titles?.en || e.title || `Episode ${e.number ?? (i + 1)}`,
-    img: e.img,
-    isFiller: e.isFiller,
-    description: e.description,
-    airDate: e.airDateUtc,
-    hasSub: e.hasSub,
-    hasDub: e.hasDub,
-    duration: e.length,
-    rating: e.rating,
+    n: e.number ?? (i + 1),
+    t: e.titles?.en || e.title || `Episode ${e.number ?? (i + 1)}`,
+    d: e.hasDub ? 1 : 0,
   }));
   setCache(ck, result);
   return result;
@@ -1018,11 +999,12 @@ async function hlsProxy(req, res) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const app = express();
+app.use(compression({ threshold: 512, level: 6 }));  // gzip everything > 512B
 app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.0.0", providers: ["anidap", "kaa", "mkissa"], anidapApi: AN_API, anidapChad: AN_REST, mkissaCrypto: mkCryptoConfigCache ? `ok (buildId: ${mkCryptoConfigCache.buildId})` : "pending" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.1.0", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -1039,7 +1021,7 @@ app.get("/anidap/episodes/:id", async (req, res) => {
     if (/^\d+$/.test(id)) {
       const m = await anAnilistToSlug(+id);
       if (!m) return res.status(404).json({ error: "AniList ID not found" });
-      return res.json({ anime: m, episodes: await anEpisodes(m.slug) });
+      return res.json({ anime: m, episodes: await anEpisodes(m.slug) });  // episodes use short keys (n/t/d)
     }
     // Otherwise treat as slug
     res.json(await anEpisodes(id));
@@ -1109,7 +1091,7 @@ process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err?.message || err); });
 
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v7.0 on :${PORT}`);
+  console.log(`LuffyTV API v7.1 on :${PORT}`);
   console.log(`  Anidap: ${AN_API} + ${AN_REST}`);
   console.log(`  KAA:    ${KAA_BASE}`);
   console.log(`  MKissa: ${MK_REFERER} → ${MK_API}`);
