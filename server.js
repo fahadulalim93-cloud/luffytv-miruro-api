@@ -1,11 +1,12 @@
 /**
- * LuffyTV Miruro API — Combined Server v7.6.0
+ * LuffyTV Miruro API — Combined Server v7.7.0
  *
- * FOUR providers running in parallel:
- *   - /anidap/*  — anidap.lol (native API: search + AniList ID lookup + chad.anidap.lol REST)
- *   - /kaa/*     — kaa.lt (fsearch API, episode servers, HLS via krussdomi)
- *   - /mkissa/*  — mkissa.to (encrypted API, multi-embed extractor, m3u8/mp4)
- *   - /miruro/*  — miruro.tv (pipe API: base64+gzip encoded, proxy required on VPS)
+ * FIVE providers running in parallel:
+ *   - /anidap/*   — anidap.lol (native API: search + AniList ID lookup + chad.anidap.lol REST)
+ *   - /kaa/*      — kaa.lt (fsearch API, episode servers, HLS via krussdomi)
+ *   - /mkissa/*   — mkissa.to (encrypted API, multi-embed extractor, m3u8/mp4)
+ *   - /miruro/*   — miruro.tv (pipe API: base64+gzip encoded, proxy required on VPS)
+ *   - /desidub/*  — desidubanime.me (Hindi/regional dubbed anime, WP REST API + HTML parsing)
  *
  * Unified routes (/search, /anilist/:id/episodes) try ALL providers.
  */
@@ -1077,6 +1078,466 @@ async function mkHandleWatch(anilistId, audio, epNum) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  DESIDUB PROVIDER  —  desidubanime.me (Hindi/regional dubbed anime)
+//  WordPress + KirAnime theme — uses WP REST API + HTML parsing for embeds
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const DD_BASE   = "https://www.desidubanime.me";
+const DD_API    = `${DD_BASE}/wp-json/wp/v2`;
+const DD_KAPI   = `${DD_BASE}/wp-json/kiranime/v1`;
+const DD_UA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const ddThrottle = new Throttler(3);
+
+// ─── DesiDub Fetch (with CF fallback) ──────────────────────────────────────────
+async function ddFetch(url, opts = {}) {
+  await ddThrottle.acquire();
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": DD_UA, Accept: "application/json", ...opts.headers },
+      signal: AbortSignal.timeout(15000),
+      ...opts,
+    });
+    if (r.status === 403 || r.status === 503) {
+      const proxy = nextProxy();
+      console.warn(`[DesiDub] fetch got HTTP ${r.status}, retrying via proxy ${proxy.replace(/\/\/[^@]+@/, "//***@")}`);
+      const gr = await gotScraping(url, {
+        method: (opts.method || "GET").toUpperCase(),
+        headers: { "User-Agent": DD_UA, Accept: "application/json", ...opts.headers },
+        timeout: { request: 15000 },
+        followRedirect: true,
+        agent: { http: undefined, https: undefined },
+        proxyUrl: proxy,
+        ...(opts.body ? { body: opts.body } : {}),
+      });
+      if (gr.statusCode >= 400) throw new Error(`DesiDub HTTP ${gr.statusCode}: ${url}`);
+      try { return JSON.parse(gr.body); } catch { return gr.body; }
+    }
+    if (!r.ok) throw new Error(`DesiDub HTTP ${r.status}: ${url}`);
+    return await r.json();
+  } finally { ddThrottle.release(); }
+}
+
+// ─── DesiDub HTML Fetch (for watch page parsing) ───────────────────────────────
+async function ddFetchHtml(url) {
+  try {
+    const r = await fetch(url, {
+      headers: { "User-Agent": DD_UA, Accept: "text/html" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (r.status === 403 || r.status === 503) {
+      const proxy = nextProxy();
+      console.warn(`[DesiDub] HTML fetch got HTTP ${r.status}, retrying via proxy`);
+      const gr = await gotScraping(url, {
+        headers: { "User-Agent": DD_UA, Accept: "text/html" },
+        timeout: { request: 15000 },
+        followRedirect: true,
+        agent: { http: undefined, https: undefined },
+        proxyUrl: proxy,
+      });
+      if (gr.statusCode >= 400) throw new Error(`DesiDub HTML HTTP ${gr.statusCode}`);
+      return gr.body;
+    }
+    if (!r.ok) throw new Error(`DesiDub HTML HTTP ${r.status}`);
+    return await r.text();
+  } catch (e) {
+    // Last resort — try proxy
+    try {
+      const proxy = nextProxy();
+      const gr = await gotScraping(url, {
+        headers: { "User-Agent": DD_UA },
+        timeout: { request: 20000 },
+        followRedirect: true,
+        agent: { http: undefined, https: undefined },
+        proxyUrl: proxy,
+      });
+      return gr.body;
+    } catch { throw e; }
+  }
+}
+
+// ─── DesiDub Search ────────────────────────────────────────────────────────────
+async function ddSearch(query) {
+  const ck = `dd-search:${query}`;
+  const c = getCached(ck); if (c) return c;
+
+  try {
+    const data = await ddFetch(`${DD_API}/anime?search=${encodeURIComponent(query)}&per_page=20&_fields=id,slug,title,link,anime_type,anime_status`);
+    const results = (Array.isArray(data) ? data : []).map(a => ({
+      id: a.id,
+      slug: a.slug,
+      title: a.title?.rendered?.replace(/&#8217;/g, "'").replace(/&#8211;/g, "-").replace(/&#038;/g, "&") || "",
+      url: a.link,
+    }));
+    setCache(ck, results);
+    return results;
+  } catch (e) {
+    console.error(`[DesiDub] search failed: ${e.message}`);
+    return [];
+  }
+}
+
+// ─── DesiDub: Resolve AniList ID → desidub anime ──────────────────────────────
+// Use AniList + ani.zip to get titles, then search desidub for matching anime
+async function ddResolveAnilistId(anilistId) {
+  const ck = `dd-resolve:${anilistId}`;
+  const c = getCached(ck); if (c) return c;
+
+  const media = await fetchAniListMedia(anilistId);
+  const anizip = await fetchAniZip(anilistId);
+  const titles = buildTitles(media, anizip);
+
+  if (!titles.length) return null;
+
+  // Try each title, pick best match
+  let bestResult = null;
+  let bestScore = 0;
+
+  for (const title of titles.slice(0, 5)) {
+    try {
+      const results = await ddSearch(title);
+      for (const r of results) {
+        const score = diceCoeff(title, r.title);
+        if (score > bestScore && score > 0.35) {
+          bestScore = score;
+          bestResult = { ...r, score, matchTitle: title };
+        }
+      }
+    } catch {}
+    if (bestScore > 0.7) break; // good enough
+  }
+
+  if (bestResult) setCache(ck, bestResult);
+  return bestResult;
+}
+
+// ─── DesiDub Episodes ──────────────────────────────────────────────────────────
+async function ddEpisodes(anilistId) {
+  const ck = `dd-eps:${anilistId}`;
+  const c = getCached(ck); if (c) return c;
+
+  const resolved = await ddResolveAnilistId(anilistId);
+  if (!resolved) return { anilistId: Number(anilistId), desidub: null, error: "Anime not found on DesiDub" };
+
+  // Strategy 1: Fetch the anime page HTML to get episode links (may only show recent)
+  let html;
+  try {
+    html = await ddFetchHtml(`${DD_BASE}/anime/${resolved.slug}/`);
+  } catch {
+    html = "";
+  }
+  
+  // Extract watch links from HTML
+  const watchLinks = new Set();
+  const linkRegex = /href=["']([^"']*\/watch\/[^"']+)["']/g;
+  let m;
+  while ((m = linkRegex.exec(html)) !== null) {
+    watchLinks.add(m[1].replace(/&amp;/g, "&"));
+  }
+
+  // Strategy 2: If we found few episodes from anime page, try the first watch page
+  // The watch page contains data-episode-search-query attributes with ALL episode numbers
+  // and data-open-nav-episode links for nearby episodes
+  if (watchLinks.size < 5 && watchLinks.size > 0) {
+    try {
+      // Get the first watch link to discover all episodes
+      const firstWatchUrl = [...watchLinks][0];
+      const watchHtml = await ddFetchHtml(firstWatchUrl);
+      
+      // Extract data-episode-search-query (contains episode numbers)
+      const epQueryRegex = /data-episode-search-query="(\d+)"/g;
+      let eqm;
+      const epNums = new Set();
+      while ((eqm = epQueryRegex.exec(watchHtml)) !== null) {
+        epNums.add(parseInt(eqm[1], 10));
+      }
+      
+      // Extract watch links from this page too
+      const watchLinkRegex2 = /href=["']([^"']*\/watch\/[^"']+)["']/g;
+      let wlm;
+      while ((wlm = watchLinkRegex2.exec(watchHtml)) !== null) {
+        watchLinks.add(wlm[1].replace(/&amp;/g, "&"));
+      }
+      
+      // For episode numbers not in watchLinks, construct URLs from pattern
+      if (epNums.size > watchLinks.size) {
+        // Find the URL pattern from existing links
+        const existingUrls = [...watchLinks];
+        for (const num of epNums) {
+          // Check if we already have this episode
+          const hasEp = existingUrls.some(u => {
+            const m = u.match(/episode-(\d+)/i);
+            return m && parseInt(m[1], 10) === num;
+          });
+          if (!hasEp && existingUrls.length > 0) {
+            // Derive URL from first existing: replace episode number
+            const base = existingUrls[0].replace(/episode-\d+/i, `episode-${num}`);
+            watchLinks.add(base);
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`[DesiDub] watch page episode discovery failed: ${e.message}`);
+    }
+  }
+
+  // Parse episode numbers from watch links — deduplicate by episode number
+  const episodes = [];
+  const seenNums = new Set();
+  const epNumRegex = /episode-(\d+)/i;
+  for (const url of watchLinks) {
+    const match = url.match(epNumRegex);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (seenNums.has(num)) continue;
+      seenNums.add(num);
+      // Extract slug from URL
+      const slugMatch = url.match(/\/watch\/([^/]+)/);
+      episodes.push({
+        number: num,
+        slug: slugMatch ? slugMatch[1] : "",
+        url: url,
+        id: `desidub/${anilistId}/hindi/${num}`,
+      });
+    }
+  }
+
+  // Sort by episode number
+  episodes.sort((a, b) => a.number - b.number);
+
+  const result = {
+    anilistId: Number(anilistId),
+    desidub: {
+      id: resolved.id,
+      slug: resolved.slug,
+      title: resolved.title,
+      matchScore: Number((resolved.score || 0).toFixed(3)),
+    },
+    language: "hindi",
+    episodes,
+  };
+  setCache(ck, result);
+  return result;
+}
+
+// ─── DesiDub: Extract servers from watch page ──────────────────────────────────
+async function ddExtractServers(watchUrl) {
+  const html = await ddFetchHtml(watchUrl);
+  const servers = [];
+
+  // Extract data-embed-id attributes: base64(serverName):base64(embedUrl)
+  const embedRegex = /data-embed-id="([^"]+)"/g;
+  let m;
+  while ((m = embedRegex.exec(html)) !== null) {
+    const raw = m[1];
+    const colonIdx = raw.indexOf(":");
+    if (colonIdx < 0) continue;
+    try {
+      const nameB64 = raw.substring(0, colonIdx);
+      const urlB64 = raw.substring(colonIdx + 1);
+      const name = Buffer.from(nameB64, "base64").toString("utf-8");
+      let url = Buffer.from(urlB64, "base64").toString("utf-8");
+      
+      // Handle Rubydub which wraps an iframe in HTML
+      const iframeMatch = url.match(/SRC=['"]([^'"]+)['"]/i);
+      if (iframeMatch) url = iframeMatch[1];
+
+      servers.push({ name, url });
+    } catch {}
+  }
+
+  return servers;
+}
+
+// ─── DesiDub: Try to extract m3u8/mp4 from embed URL ──────────────────────────
+async function ddExtractStream(embedUrl, serverName) {
+  try {
+    // CLOUD server: has /external/{hash} → sources array with /play/{hash}
+    if (embedUrl.includes("cloud.desidubanime.me")) {
+      const html = await ddFetchHtml(embedUrl);
+      // Look for sources JSON array in script
+      const sourcesMatch = html.match(/const\s+sources\s*=\s*(\[[\s\S]*?\]);/);
+      if (sourcesMatch) {
+        try {
+          const sources = JSON.parse(sourcesMatch[1]);
+          // Each source has a /play/{hash} URL — construct full URL
+          const streams = [];
+          for (const s of sources) {
+            const playUrl = s.url.startsWith("/") ? `https://cloud.desidubanime.me${s.url}` : s.url;
+            streams.push({
+              server: `${serverName} - ${s.name}`,
+              url: playUrl,
+              type: "embed",
+              headers: { Referer: embedUrl },
+            });
+          }
+          return streams;
+        } catch {}
+      }
+      // Fallback: look for iframe to /play/
+      const iframeMatch = html.match(/src=["']([^"']*\/play\/[^"']+)["']/);
+      if (iframeMatch) {
+        const playUrl = iframeMatch[1].startsWith("/") ? `https://cloud.desidubanime.me${iframeMatch[1]}` : iframeMatch[1];
+        return [{ server: serverName, url: playUrl, type: "embed", headers: { Referer: embedUrl } }];
+      }
+    }
+
+    // Abyssdub: abyssplayer.com — has SoTrym + base64 datas
+    // The m3u8 is loaded via JS (SoTrym function from iamcdn.net), too complex to extract server-side
+    // Return the embed URL and let the client handle it
+    if (embedUrl.includes("abyssplayer.com") || embedUrl.includes("abyss.to")) {
+      return [{ server: serverName, url: embedUrl, type: "embed", headers: { Referer: "https://www.desidubanime.me/" } }];
+    }
+
+    // Mirrordub: gdmirrorbot.nl — uses /embedhelper2.php POST behind CF
+    // Return embed URL, client can iframe it
+    if (embedUrl.includes("gdmirrorbot.nl")) {
+      return [{ server: serverName, url: embedUrl, type: "embed", headers: { Referer: "https://www.desidubanime.me/" } }];
+    }
+
+    // PlayerXdub: boosterx.stream / newer.stream
+    if (embedUrl.includes("boosterx.stream") || embedUrl.includes("newer.stream")) {
+      return [{ server: serverName, url: embedUrl, type: "embed", headers: { Referer: "https://www.desidubanime.me/" } }];
+    }
+
+    // Rubydub: rubyvidhub.com
+    if (embedUrl.includes("rubyvidhub.com")) {
+      // Try to fetch the embed page and look for direct video URL
+      const html = await ddFetchHtml(embedUrl);
+      const m3u8Match = html.match(/(https?:\/\/[^\s"'<>]+?\.m3u8[^\s"'<>]*)/);
+      if (m3u8Match) {
+        return [{ server: serverName, url: m3u8Match[1], type: "hls", headers: { Referer: embedUrl } }];
+      }
+      const mp4Match = html.match(/(https?:\/\/[^\s"'<>]+?\.mp4[^\s"'<>]*)/);
+      if (mp4Match) {
+        return [{ server: serverName, url: mp4Match[1], type: "mp4", headers: { Referer: embedUrl } }];
+      }
+      return [{ server: serverName, url: embedUrl, type: "embed", headers: { Referer: "https://www.desidubanime.me/" } }];
+    }
+
+    // FileMoondub: bysesukior.com — SPA, can't extract server-side
+    if (embedUrl.includes("bysesukior.com")) {
+      return [{ server: serverName, url: embedUrl, type: "embed", headers: { Referer: "https://www.desidubanime.me/" } }];
+    }
+
+    // Streamp2p: p2pplay.pro — embed URL, may contain direct stream
+    if (embedUrl.includes("p2pplay.pro")) {
+      // Try to fetch and find m3u8/mp4
+      try {
+        const html = await ddFetchHtml(embedUrl);
+        const m3u8Match = html.match(/(https?:\/\/[^\s"'<>]+?\.m3u8[^\s"'<>]*)/);
+        if (m3u8Match) {
+          return [{ server: serverName, url: m3u8Match[1], type: "hls", headers: { Referer: embedUrl } }];
+        }
+      } catch {}
+      return [{ server: serverName, url: embedUrl, type: "embed", headers: { Referer: "https://www.desidubanime.me/" } }];
+    }
+
+    // VMoly / vmeas.cloud — direct m3u8 streams
+    if (embedUrl.includes("vmeas.cloud") || embedUrl.includes(".m3u8")) {
+      return [{ server: serverName, url: embedUrl, type: "hls", headers: { Referer: "https://www.desidubanime.me/" } }];
+    }
+
+    // Generic: try to fetch and find m3u8/mp4
+    const html = await ddFetchHtml(embedUrl);
+    const m3u8Match = html.match(/(https?:\/\/[^\s"'<>]+?\.m3u8[^\s"'<>]*)/);
+    if (m3u8Match) {
+      return [{ server: serverName, url: m3u8Match[1], type: "hls", headers: { Referer: embedUrl } }];
+    }
+    const mp4Match = html.match(/(https?:\/\/[^\s"'<>]+?\.mp4[^\s"'<>]*)/);
+    if (mp4Match) {
+      return [{ server: serverName, url: mp4Match[1], type: "mp4", headers: { Referer: embedUrl } }];
+    }
+
+    // Can't extract — return embed URL
+    return [{ server: serverName, url: embedUrl, type: "embed", headers: { Referer: "https://www.desidubanime.me/" } }];
+  } catch (e) {
+    console.error(`[DesiDub] extractStream failed for ${embedUrl}: ${e.message}`);
+    return [{ server: serverName, url: embedUrl, type: "embed", headers: { Referer: "https://www.desidubanime.me/" } }];
+  }
+}
+
+// ─── DesiDub Watch (single episode) ────────────────────────────────────────────
+async function ddWatch(anilistId, epNum) {
+  const ck = `dd-watch:${anilistId}:${epNum}`;
+  const c = getCached(ck); if (c) return c;
+
+  const resolved = await ddResolveAnilistId(anilistId);
+  if (!resolved) throw new Error(`DesiDub: anime not found for AniList ${anilistId}`);
+
+  // Build watch URL from slug pattern
+  // Episode URLs follow: /watch/{anime-slug}-episode-{num}/
+  // But the slug in watch URLs may differ from anime slug
+  // Safer: get episode list first, find matching URL
+  const epData = await ddEpisodes(anilistId);
+  const ep = epData.episodes?.find(e => e.number === Number(epNum));
+  
+  let watchUrl;
+  if (ep && ep.url) {
+    watchUrl = ep.url;
+  } else {
+    // Fallback: guess the URL pattern
+    watchUrl = `${DD_BASE}/watch/${resolved.slug}-episode-${epNum}/`;
+  }
+
+  // Extract server embeds from watch page
+  const servers = await ddExtractServers(watchUrl);
+  if (!servers.length) throw new Error(`DesiDub: no servers found for episode ${epNum}`);
+
+  // Try to extract streams from each server (in parallel)
+  const streamResults = await Promise.all(
+    servers.map(async (s) => {
+      try {
+        return await ddExtractStream(s.url, s.name);
+      } catch {
+        return [{ server: s.name, url: s.url, type: "embed" }];
+      }
+    })
+  );
+
+  const streams = streamResults.flat();
+
+  const result = {
+    anilistId: Number(anilistId),
+    episode: Number(epNum),
+    language: "hindi",
+    audio: "hindi",
+    servers: servers.map(s => ({ name: s.name, url: s.url })),
+    streams,
+  };
+  setCache(ck, result);
+  return result;
+}
+
+// ─── DesiDub All Sources (all episodes for an anime, limited) ──────────────────
+// Returns the same format as other all-sources endpoints: { sub: [], dub: [] }
+// For DesiDub, everything goes in "dub" since it's all Hindi dubbed
+async function ddAllSources(anilistId, epNum) {
+  const ck = `dd-allsrc:${anilistId}:${epNum}`;
+  const c = getCached(ck); if (c) return c;
+
+  const watchResult = await ddWatch(anilistId, epNum);
+  
+  // Convert to unified format: { sub: [], dub: [] }
+  const out = { sub: [], dub: [] };
+  for (const s of watchResult.streams) {
+    out.dub.push({
+      provider: `desidub-${s.server}`,
+      url: s.url,
+      urls: [s.url],
+      quality: "auto",
+      type: s.type,
+      server: s.server,
+      isHardSub: false,
+      subs: [],
+      headers: s.headers || {},
+    });
+  }
+
+  setCache(ck, out);
+  return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  HLS PROXY
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1435,7 +1896,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.6.0", providers: ["anidap", "kaa", "mkissa", "miruro"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.7.0", providers: ["anidap", "kaa", "mkissa", "miruro", "desidub"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -1510,6 +1971,12 @@ app.get("/miruro/all-sources/:anilistId/:ep", async (req, res) => {
   catch (e) { res.status(502).json({ error: e.message }); }
 });
 
+// ─── DESIDUB ROUTES ──────────────────────────────────────────────────────────
+app.get("/desidub/search", async (req, res) => { try { res.json(await ddSearch(req.query.q || "")); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/desidub/episodes/:anilistId", async (req, res) => { try { res.json(await ddEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/desidub/watch/:anilistId/:ep", async (req, res) => { try { res.json(await ddWatch(+req.params.anilistId, +req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/desidub/all-sources/:anilistId/:ep", async (req, res) => { try { res.json(await ddAllSources(+req.params.anilistId, +req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
+
 // ─── UNIFIED ROUTES ───────────────────────────────────────────────────────────
 app.get("/search", async (req, res) => {
   const q = req.query.q; if (!q) return res.status(400).json({ error: "Missing ?q=" });
@@ -1547,11 +2014,12 @@ process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err?.message || err); });
 
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v7.6 on :${PORT}`);
+  console.log(`LuffyTV API v7.7 on :${PORT}`);
   console.log(`  Anidap: ${AN_API} + ${AN_REST}`);
   console.log(`  KAA:    ${KAA_BASE}`);
   console.log(`  MKissa: ${MK_REFERER} → ${MK_API}`);
   console.log(`  Miruro: ${MIRURO_PIPE} (proxy-required)`);
+  console.log(`  DesiDub: ${DD_BASE} (Hindi/regional dubbed)`);
   // Warm up MKissa crypto config
   mkDiscoverCryptoConfig().then(c => console.log(`[MKissa] Crypto config warmed up: buildId=${c.buildId}`)).catch(e => console.warn(`[MKissa] Crypto warmup failed: ${e.message}`));
   // Warm up Miruro session
