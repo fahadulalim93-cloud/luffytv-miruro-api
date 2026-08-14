@@ -1097,6 +1097,176 @@ async function hlsProxy(req, res) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  MIRURO PROVIDER  —  miruro.tv pipe API (base64+gzip encoded)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+import { gunzipSync } from "node:zlib";
+
+const MIRURO_PIPE = "https://www.miruro.tv/api/secure/pipe";
+const MIRURO_H = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept": "*/*",
+  "Origin": "https://www.miruro.tv",
+  "Referer": "https://www.miruro.tv/",
+  "sec-fetch-site": "same-origin",
+  "sec-fetch-mode": "cors",
+  "sec-fetch-dest": "empty",
+};
+const miruroThrottle = new Throttler(3);
+
+// Encode pipe request: base64url(JSON)
+function miruroEncode(payload) {
+  return Buffer.from(JSON.stringify(payload)).toString("base64url").replace(/=+$/, "");
+}
+
+// Decode pipe response: base64url → gunzip → JSON
+function miruroDecode(encoded) {
+  const padded = encoded + "=".repeat((4 - encoded.length % 4) % 4);
+  const compressed = Buffer.from(padded, "base64url");
+  const json = gunzipSync(compressed).toString("utf-8");
+  return JSON.parse(json);
+}
+
+// Translate base64 IDs to plaintext
+function miruroTranslateId(encodedId) {
+  try {
+    const padded = encodedId + "=".repeat((4 - encodedId.length % 4) % 4);
+    const decoded = Buffer.from(padded, "base64url").toString("utf-8");
+    if (decoded.includes(":")) return decoded;
+    return encodedId;
+  } catch { return encodedId; }
+}
+
+// Deep translate all 'id' fields in response
+function miruroDeepTranslate(obj) {
+  if (!obj || typeof obj !== "object") return;
+  if (Array.isArray(obj)) { obj.forEach(miruroDeepTranslate); return; }
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === "id" && typeof v === "string") obj[k] = miruroTranslateId(v);
+    else if (v && typeof v === "object") miruroDeepTranslate(v);
+  }
+}
+
+// Fetch from miruro pipe — needs got-scraping (browser TLS) for Cloudflare
+async function miruroFetch(path, query) {
+  const payload = { path, method: "GET", query, body: null, version: "0.1.0" };
+  const encoded = miruroEncode(payload);
+  const url = `${MIRURO_PIPE}?e=${encoded}`;
+  await miruroThrottle.acquire();
+  try {
+    // Try regular fetch first (works on residential IPs)
+    const r = await fetch(url, { headers: MIRURO_H, signal: AbortSignal.timeout(15000) });
+    const ct = r.headers.get("content-type") || "";
+    // If Cloudflare returns HTML challenge page, fall back to got-scraping
+    if (ct.includes("text/html") || r.status === 403 || r.status === 503) {
+      const proxy = nextProxy();
+      console.warn(`[Miruro] fetch blocked (HTTP ${r.status} / ${ct.slice(0,30)}), retrying via proxy`);
+      const gr = await gotScraping(url, {
+        headers: MIRURO_H,
+        timeout: { request: 15000 },
+        followRedirect: true,
+        agent: { http: undefined, https: undefined },
+        proxyUrl: proxy,
+      });
+      if (gr.statusCode >= 400) throw new Error(`HTTP ${gr.statusCode}`);
+      return miruroDecode(gr.body.trim());
+    }
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const text = await r.text();
+    return miruroDecode(text.trim());
+  } finally { miruroThrottle.release(); }
+}
+
+// Miruro episodes — returns { providers: { name: { episodes: { sub: [], dub: [] } } } }
+async function miruroEpisodes(anilistId) {
+  const ck = `mir-eps:${anilistId}`;
+  const c = getCached(ck); if (c) return c;
+  const data = await miruroFetch("episodes", { anilistId });
+  miruroDeepTranslate(data);
+  setCache(ck, data);
+  return data;
+}
+
+// Miruro sources — episodeId, provider, category (sub/dub)
+async function miruroSources(episodeId, provider, anilistId, category = "sub") {
+  const ck = `mir-src:${episodeId}:${provider}:${category}`;
+  const c = getCached(ck); if (c) return c;
+  // episodeId needs to be base64url encoded for the pipe
+  const encId = Buffer.from(episodeId).toString("base64url").replace(/=+$/, "");
+  const data = await miruroFetch("sources", { episodeId: encId, provider, category, anilistId });
+  setCache(ck, data);
+  return data;
+}
+
+// Miruro all-sources — fetch all providers for an episode
+async function miruroAllSources(anilistId, epNum, category = "sub") {
+  const ck = `mir-allsrc:${anilistId}:${epNum}:${category}`;
+  const c = getCached(ck); if (c) return c;
+  
+  // Get episodes first to find provider + episode IDs
+  const epData = await miruroEpisodes(anilistId);
+  const providers = epData?.providers || {};
+  
+  const results = [];
+  const tasks = [];
+  let delay = 0;
+  
+  for (const [provName, provData] of Object.entries(providers)) {
+    const eps = provData?.episodes?.[category] || [];
+    const ep = eps.find(e => e.number === epNum);
+    if (!ep || !ep.id) continue;
+    
+    const epId = ep.id;
+    tasks.push({
+      provider: provName,
+      category,
+      promise: (async () => {
+        await new Promise(r => setTimeout(r, delay));
+        try { return await miruroSources(epId, provName, anilistId, category); }
+        catch { return null; }
+      })(),
+    });
+    delay += 200;
+  }
+  
+  const responses = await Promise.all(tasks.map(t => t.promise));
+  
+  for (let i = 0; i < tasks.length; i++) {
+    const { provider, category: cat } = tasks[i];
+    const raw = responses[i];
+    if (!raw) continue;
+    
+    const sources = Array.isArray(raw?.sources) ? raw.sources : [];
+    const streamUrls = sources.map(s => s.url || s.file).filter(Boolean);
+    if (streamUrls.length === 0) continue;
+    
+    const tracks = Array.isArray(raw?.tracks) ? raw.tracks : [];
+    const subs = tracks.filter(t => t?.url && (t.kind === "captions" || t.kind === "subtitles"))
+      .map(t => ({ url: t.url, lang: t.lang || t.label || "en", label: t.label || "" }));
+    
+    const chapters = Array.isArray(raw?.chapters) ? raw.chapters : [];
+    const intro = chapters.find(c => /intro/i.test(c.title || ""));
+    const outro = chapters.find(c => /outro|ending/i.test(c.title || ""));
+    const headers = raw?.headers || {};
+    
+    results.push({
+      provider,
+      url: streamUrls[0],
+      urls: streamUrls,
+      quality: sources[0]?.quality || "auto",
+      isHardSub: false,
+      subs,
+      intro: intro ? { start: intro.start, end: intro.end } : undefined,
+      outro: outro ? { start: outro.start, end: outro.end } : undefined,
+      headers: Object.keys(headers).length ? headers : undefined,
+    });
+  }
+  
+  setCache(ck, results);
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  EXPRESS ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1106,7 +1276,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.4.0", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.5.0", providers: ["anidap", "kaa", "mkissa", "miruro"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -1164,6 +1334,20 @@ app.get("/mkissa/search", async (req, res) => { try { res.json(await mkSearch(re
 app.get("/mkissa/episodes/:anilistId", async (req, res) => { try { res.json(await mkHandleEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/mkissa/watch/:anilistId/:audio/:ep", async (req, res) => { try { res.json(await mkHandleWatch(+req.params.anilistId, req.params.audio, +req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
 
+// ─── MIRURO ROUTES ────────────────────────────────────────────────────────────
+app.get("/miruro/episodes/:anilistId", async (req, res) => { try { res.json(await miruroEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/miruro/sources", async (req, res) => {
+  try {
+    const { episodeId, provider, anilistId, category } = req.query;
+    if (!episodeId || !provider || !anilistId) return res.status(400).json({ error: "Missing episodeId, provider, or anilistId" });
+    res.json(await miruroSources(episodeId, provider, +anilistId, category || "sub"));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.get("/miruro/all-sources/:anilistId/:ep", async (req, res) => {
+  try { res.json(await miruroAllSources(+req.params.anilistId, +req.params.ep, req.query.category || "sub")); }
+  catch (e) { res.status(502).json({ error: e.message }); }
+});
+
 // ─── UNIFIED ROUTES ───────────────────────────────────────────────────────────
 app.get("/search", async (req, res) => {
   const q = req.query.q; if (!q) return res.status(400).json({ error: "Missing ?q=" });
@@ -1201,10 +1385,11 @@ process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err?.message || err); });
 
 app.listen(PORT, () => {
-  console.log(`LuffyTV API v7.1 on :${PORT}`);
+  console.log(`LuffyTV API v7.5 on :${PORT}`);
   console.log(`  Anidap: ${AN_API} + ${AN_REST}`);
   console.log(`  KAA:    ${KAA_BASE}`);
   console.log(`  MKissa: ${MK_REFERER} → ${MK_API}`);
+  console.log(`  Miruro: ${MIRURO_PIPE}`);
   // Warm up MKissa crypto config
   mkDiscoverCryptoConfig().then(c => console.log(`[MKissa] Crypto config warmed up: buildId=${c.buildId}`)).catch(e => console.warn(`[MKissa] Crypto warmup failed: ${e.message}`));
 });

@@ -1,6 +1,6 @@
 {
   "name": "luffytv-miruro-api",
-  "version": "7.4.0",
+  "version": "7.5.0",
   "description": "LuffyTV API — Anidap + KAA + MKissa providers, AniList ID routing (no slug needed), HLS proxy, m3u8/mp4 sources",
   "main": "server.js",
   "scripts": {
