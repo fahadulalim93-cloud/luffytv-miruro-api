@@ -1,5 +1,5 @@
 /**
- * LuffyTV Miruro API — Combined Server v7.7.0
+ * LuffyTV Miruro API — Combined Server v7.8.0
  *
  * FIVE providers running in parallel:
  *   - /anidap/*   — anidap.lol (native API: search + AniList ID lookup + chad.anidap.lol REST)
@@ -23,8 +23,8 @@ const CACHE_TTL_LONG = CACHE_TTL * 4;  // 4hr for stable data (slug mapping)
 
 // ─── Shared Cache ──────────────────────────────────────────────────────────────
 const cache = new Map();
-function getCached(key) { const e = cache.get(key); if (e && Date.now() - e.ts < CACHE_TTL) return e.data; cache.delete(key); return null; }
-function setCache(key, data) { cache.set(key, { data, ts: Date.now() }); }
+function getCached(key, ttl) { const e = cache.get(key); if (e && Date.now() - e.ts < (ttl || CACHE_TTL)) return e.data; cache.delete(key); return null; }
+function setCache(key, data, ttl) { cache.set(key, { data, ts: Date.now(), ttl: ttl || CACHE_TTL }); }
 
 // ─── Shared Throttler ──────────────────────────────────────────────────────────
 class Throttler {
@@ -1896,7 +1896,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.7.0", providers: ["anidap", "kaa", "mkissa", "miruro", "desidub"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.8.0", providers: ["anidap", "kaa", "mkissa", "miruro", "desidub"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
@@ -1949,10 +1949,106 @@ app.get("/kaa/search", async (req, res) => { try { const results = await kaaSear
 app.get("/kaa/episodes/:anilistId", async (req, res) => { try { res.json(await kaaGetEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/kaa/watch/:anilistId/:audio/:ep", async (req, res) => { try { res.json(await kaaHandleWatch(+req.params.anilistId, req.params.audio, +req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
 
+// ─── MKISSA CATALOG / BROWSE HELPERS ──────────────────────────────────────────
+async function mkCatalog({ page = 1, limit = 30, type = "sub", country = "ALL", query = "" } = {}) {
+  const ck = `mk-catalog:${page}:${limit}:${type}:${country}:${query}`;
+  const c = getCached(ck); if (c) return c;
+  const gql = `query($search:SearchInput $limit:Int $page:Int $translationType:VaildTranslationTypeEnumType $countryOrigin:VaildCountryOriginEnumType){shows(search:$search limit:$limit page:$page translationType:$translationType countryOrigin:$countryOrigin){edges{_id name englishName nativeName slugTime availableEpisodes availableEpisodesDetail aniListId score type season thumbnail episodeDuration} pageInfo{total}}}`;
+  const searchInput = { allowAdult: false, allowUnknown: false };
+  if (query) searchInput.query = query;
+  const data = await mkApiPost(gql, { search: searchInput, limit: Math.min(limit, 50), page, translationType: type, countryOrigin: country });
+  const result = {
+    page, limit, total: data?.shows?.pageInfo?.total ?? 0,
+    anime: (data?.shows?.edges ?? []).map(e => ({
+      id: e._id, aniListId: e.aniListId ? Number(e.aniListId) : null,
+      name: e.englishName || e.name, nativeName: e.nativeName,
+      slug: e.slugTime, score: e.score, type: e.type,
+      season: e.season, thumbnail: e.thumbnail,
+      duration: e.episodeDuration,
+      episodes: { sub: e.availableEpisodes?.sub ?? 0, dub: e.availableEpisodes?.dub ?? 0, raw: e.availableEpisodes?.raw ?? 0 },
+      episodeList: { sub: (e.availableEpisodesDetail?.sub || []).map(Number).sort((a, b) => a - b), dub: (e.availableEpisodesDetail?.dub || []).map(Number).sort((a, b) => a - b) },
+    }))
+  };
+  setCache(ck, result, 600000);
+  return result;
+}
+
+async function mkPopular({ page = 1, limit = 30, type = "sub", country = "ALL", range = 1 } = {}) {
+  const ck = `mk-popular:${page}:${limit}:${type}:${country}:${range}`;
+  const c = getCached(ck); if (c) return c;
+  // Use the /popular endpoint equivalent via search with score-based heuristic
+  // The mkissa site has a /popular?type=anime&range=1 page — fetch it via GraphQL with all shows, then sort by score
+  const gql = `query($search:SearchInput $limit:Int $page:Int $translationType:VaildTranslationTypeEnumType $countryOrigin:VaildCountryOriginEnumType){shows(search:$search limit:$limit page:$page translationType:$translationType countryOrigin:$countryOrigin){edges{_id name englishName nativeName slugTime availableEpisodes aniListId score type season thumbnail} pageInfo{total}}}`;
+  const searchInput = { allowAdult: false, allowUnknown: false };
+  const data = await mkApiPost(gql, { search: searchInput, limit: Math.min(limit, 50), page, translationType: type, countryOrigin: country });
+  const edges = (data?.shows?.edges ?? []).sort((a, b) => (b.score || 0) - (a.score || 0));
+  const result = {
+    page, limit, range,
+    anime: edges.map(e => ({
+      id: e._id, aniListId: e.aniListId ? Number(e.aniListId) : null,
+      name: e.englishName || e.name, nativeName: e.nativeName,
+      slug: e.slugTime, score: e.score, type: e.type,
+      season: e.season, thumbnail: e.thumbnail,
+      episodes: { sub: e.availableEpisodes?.sub ?? 0, dub: e.availableEpisodes?.dub ?? 0 },
+    }))
+  };
+  setCache(ck, result, 600000);
+  return result;
+}
+
+async function mkAiringSchedule({ page = 1, limit = 30, type = "sub" } = {}) {
+  const ck = `mk-airing:${page}:${limit}:${type}`;
+  const c = getCached(ck); if (c) return c;
+  const gql = `query($search:SearchInput $limit:Int $page:Int $translationType:VaildTranslationTypeEnumType $countryOrigin:VaildCountryOriginEnumType){shows(search:$search limit:$limit page:$page translationType:$translationType countryOrigin:$countryOrigin){edges{_id name englishName nativeName slugTime availableEpisodes aniListId score type season thumbnail} pageInfo{total}}}`;
+  const data = await mkApiPost(gql, { search: { allowAdult: false, allowUnknown: false }, limit: Math.min(limit, 50), page, translationType: type, countryOrigin: "JP" });
+  const result = {
+    page, limit,
+    anime: (data?.shows?.edges ?? []).map(e => ({
+      id: e._id, aniListId: e.aniListId ? Number(e.aniListId) : null,
+      name: e.englishName || e.name, nativeName: e.nativeName,
+      score: e.score, type: e.type, season: e.season, thumbnail: e.thumbnail,
+      episodes: { sub: e.availableEpisodes?.sub ?? 0, dub: e.availableEpisodes?.dub ?? 0 },
+    }))
+  };
+  setCache(ck, result, 300000);
+  return result;
+}
+
 // ─── MKISSA ROUTES ────────────────────────────────────────────────────────────
 app.get("/mkissa/search", async (req, res) => { try { res.json(await mkSearch(req.query.q || "", req.query.mode || "sub")); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/mkissa/episodes/:anilistId", async (req, res) => { try { res.json(await mkHandleEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
 app.get("/mkissa/watch/:anilistId/:audio/:ep", async (req, res) => { try { res.json(await mkHandleWatch(+req.params.anilistId, req.params.audio, +req.params.ep)); } catch (e) { res.status(502).json({ error: e.message }); } });
+app.get("/mkissa/catalog", async (req, res) => {
+  try {
+    res.json(await mkCatalog({
+      page: Math.max(1, +req.query.page || 1),
+      limit: Math.min(50, Math.max(1, +req.query.limit || 30)),
+      type: req.query.type || "sub",
+      country: req.query.country || "ALL",
+      query: req.query.q || "",
+    }));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.get("/mkissa/popular", async (req, res) => {
+  try {
+    res.json(await mkPopular({
+      page: Math.max(1, +req.query.page || 1),
+      limit: Math.min(50, Math.max(1, +req.query.limit || 30)),
+      type: req.query.type || "sub",
+      country: req.query.country || "ALL",
+      range: +req.query.range || 1,
+    }));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
+app.get("/mkissa/airing", async (req, res) => {
+  try {
+    res.json(await mkAiringSchedule({
+      page: Math.max(1, +req.query.page || 1),
+      limit: Math.min(50, Math.max(1, +req.query.limit || 30)),
+      type: req.query.type || "sub",
+    }));
+  } catch (e) { res.status(502).json({ error: e.message }); }
+});
 
 // ─── MIRURO ROUTES ────────────────────────────────────────────────────────────
 app.get("/miruro/episodes/:anilistId", async (req, res) => { try { res.json(await miruroEpisodes(+req.params.anilistId)); } catch (e) { res.status(502).json({ error: e.message }); } });
