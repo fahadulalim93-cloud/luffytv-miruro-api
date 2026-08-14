@@ -13,7 +13,6 @@ import express from "express";
 import cors from "cors";
 import compression from "compression";
 import crypto from "node:crypto";
-import { gotScraping } from "got-scraping";
 
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);  // 1hr default
@@ -128,26 +127,22 @@ async function anFetch(url, retries = 2) {
   throw new Error(`Anidap fetch failed: ${url}`);
 }
 
-// Chad API uses got-scraping (browser TLS fingerprint) to bypass Cloudflare
+// Chad API — regular fetch() with browser headers (Cloudflare bypasses without got-scraping)
 async function anChadFetch(path, retries = 1) {
   const url = `${AN_REST}${path}`;
   for (let i = 0; i <= retries; i++) {
     await anThrottle.acquire();
     try {
-      const r = await gotScraping(url, {
-        headers: { ...AN_HEADERS, Accept: "application/json" },
-        timeout: { request: 12000 },
-        followRedirect: true,
-      });
-      if (r.statusCode === 429) {
-        let j = {};
-        try { j = JSON.parse(r.body); } catch {}
+      const r = await fetch(url, { headers: AN_HEADERS, signal: AbortSignal.timeout(15000) });
+      if (r.status === 429) {
+        const j = await r.json().catch(() => ({}));
         const wait = j.retry_after ? Math.min(j.retry_after * 1000, 30000) : 5000;
         console.warn(`[Anidap/Chad] 429, waiting ${wait}ms`);
         await new Promise(r => setTimeout(r, wait));
         continue;
       }
-      return JSON.parse(r.body);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return await r.json();
     } catch (e) { if (i === retries) console.warn(`[Anidap/Chad] ${url} failed: ${e.message}`); }
     finally { anThrottle.release(); }
   }
@@ -303,16 +298,15 @@ async function kaaFetch(url, opts = {}) {
   await kaaThrottle.acquire();
   try {
     const method = (opts.method || "GET").toUpperCase();
-    const gotOpts = {
+    const fetchOpts = {
       method,
       headers: { ...KAA_H, ...opts.headers },
-      timeout: { request: 15000 },
-      followRedirect: true,
+      signal: AbortSignal.timeout(15000),
     };
-    if (opts.body) gotOpts.body = opts.body;
-    const r = await gotScraping(url, gotOpts);
-    if (r.statusCode >= 400) throw new Error(`KAA HTTP ${r.statusCode}: ${url}`);
-    return JSON.parse(r.body);
+    if (opts.body) fetchOpts.body = opts.body;
+    const r = await fetch(url, fetchOpts);
+    if (!r.ok) throw new Error(`KAA HTTP ${r.status}: ${url}`);
+    return await r.json();
   } finally { kaaThrottle.release(); }
 }
 
@@ -993,7 +987,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.1.0", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.2.0", providers: ["anidap", "kaa", "mkissa"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
