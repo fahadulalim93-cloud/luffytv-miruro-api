@@ -1,5 +1,5 @@
 /**
- * LuffyTV Miruro API — Combined Server v7.8.0
+ * LuffyTV Miruro API — Combined Server v7.9.0
  *
  * FIVE providers running in parallel:
  *   - /anidap/*   — anidap.lol (native API: search + AniList ID lookup + chad.anidap.lol REST)
@@ -15,7 +15,11 @@ import express from "express";
 import cors from "cors";
 import compression from "compression";
 import crypto from "node:crypto";
+import { readFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { gotScraping } from "got-scraping";
+
+const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
 const PORT = process.env.PORT || 3000;
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "3600000", 10);  // 1hr default
@@ -991,7 +995,46 @@ function mkFindBestMatch(results, titles, targetYear, targetId) {
   return best || results[0];
 }
 
+// ─── MKissa Prebuilt Database (AniList ID → MKissa ID mapping) ────────────────
+let mkDb = null;
+function mkLoadDb() {
+  if (mkDb !== null) return;
+  mkDb = new Map();
+  try {
+    const dbPath = __dirname + "mkissa-db.json";
+    if (existsSync(dbPath)) {
+      const raw = JSON.parse(readFileSync(dbPath, "utf8"));
+      for (const [k, v] of Object.entries(raw)) mkDb.set(Number(k), v);
+      console.log(`[MKissa] Loaded DB: ${mkDb.size} anime mapped`);
+    }
+  } catch (e) { console.warn(`[MKissa] DB load failed: ${e.message}`); }
+}
+
 async function mkResolveMkissaId(anilistId) {
+  // FAST PATH: check prebuilt DB first
+  if (mkDb === null) mkLoadDb();
+  const dbEntry = mkDb.get(Number(anilistId));
+  if (dbEntry) {
+    return {
+      showId: dbEntry.i,
+      show: {
+        _id: dbEntry.i,
+        name: dbEntry.n,
+        englishName: dbEntry.n,
+        nativeName: dbEntry.n,
+        slugTime: dbEntry.s,
+        aniListId: String(anilistId),
+        score: dbEntry.sc,
+        type: dbEntry.t,
+        availableEpisodes: { sub: dbEntry.sub ?? 0, dub: dbEntry.dub ?? 0 },
+        availableEpisodesDetail: { sub: [], dub: [] },
+      },
+      anizip: {},
+      _fromDb: true,
+    };
+  }
+
+  // SLOW PATH: search by title (existing logic)
   const [anizipRes, alMedia] = await Promise.all([fetchAniZip(anilistId).catch(() => ({})), fetchAniListMedia(anilistId).catch(() => null)]);
   const anizip = anizipRes || {};
   let titlesToTry = [];
@@ -1023,15 +1066,16 @@ async function mkExtractStreamSB(id) { try { const bh = { "User-Agent": MK_UA, R
 
 async function mkExtractStreamlare(id) { try { const r = await mkFetchWithTimeout("https://streamlare.com/api/video/stream/get", { method: "POST", headers: { "Content-Type": "application/json", "User-Agent": MK_UA, Referer: "https://streamlare.com/", Origin: "https://streamlare.com" }, body: JSON.stringify({ id }) }); if (!r.ok) return null; const data = await r.json(); return data?.data?.file ?? null; } catch { return null; } }
 
-async function mkExtractClock(url) { try { const clockUrl = url.replace("/clock", "/clock.json"); const r = await mkFetchWithTimeout(clockUrl, { headers: { "User-Agent": MK_UA, Referer: "https://allanime.day/player.html" } }); if (!r.ok) return null; const data = await r.json(); const links = Array.isArray(data?.links) ? data.links : []; const best = links.find(i => i?.hls && i?.link) || links.find(i => i?.link); return best?.link || null; } catch { return null; } }
+async function mkExtractClock(url) { try { const clockUrl = /\/clock\.json[/?]/i.test(url) ? url : url.replace("/clock?", "/clock.json?"); const r = await mkFetchWithTimeout(clockUrl, { headers: { "User-Agent": MK_UA, Referer: "https://allanime.day/player.html" } }); if (!r.ok) return null; const data = await r.json(); const links = Array.isArray(data?.links) ? data.links : []; const best = links.find(i => i?.hls && i?.link) || links.find(i => i?.link); return best?.link || null; } catch { return null; } }
 
 function mkEmbedMediaType(url) { if (!url) return null; if (url.includes(".m3u8")) return "hls"; if (url.includes(".mp4")) return "mp4"; return "direct"; }
 
 async function mkExtractSource(src) {
   let url = src.sourceUrl;
   if (url && url.startsWith("--")) url = mkDecodeHexUrl(url.slice(2));
-  if (url && url.startsWith("/apivtwo/clock")) url = "https://allanime.day" + url.replace("/clock", "/clock.json");
-  if (url && /^https?:\/\/allanime\.day\/apivtwo\/clock(?:\.json)?/i.test(url)) url = url.replace("/clock?", "/clock.json?");
+  if (url && url.startsWith("/apivtwo/clock")) url = "https://allanime.day" + url;
+  // Ensure URL ends with clock.json not /clock
+  if (url && /\/apivtwo\/clock(?!\.json)/i.test(url)) url = url.replace("/clock?", "/clock.json?");
   let extractedUrl = null;
   try {
     const host = new URL(url).hostname.replace(/^www\./, "");
@@ -1050,8 +1094,19 @@ async function mkExtractSource(src) {
 async function mkHandleEpisodes(anilistId) {
   const ck = `mk-episodes:${anilistId}`;
   const c = getCached(ck); if (c) return c;
-  const { showId, show, anizip } = await mkResolveMkissaId(anilistId);
-  const epDetail = show.availableEpisodesDetail || {};
+  const { showId, show, anizip, _fromDb } = await mkResolveMkissaId(anilistId);
+  
+  // If from DB with no episode detail, fetch via search to get availableEpisodesDetail
+  let epDetail = show.availableEpisodesDetail || {};
+  if (_fromDb && (!epDetail.sub?.length && !epDetail.dub?.length)) {
+    try {
+      const searchResults = await mkSearch(show.englishName || show.name, "sub");
+      const match = searchResults.find(r => r._id === showId) || searchResults[0];
+      if (match?.availableEpisodesDetail) epDetail = match.availableEpisodesDetail;
+      if (match && !show.availableEpisodes) show.availableEpisodes = match.availableEpisodes;
+    } catch {}
+  }
+  
   const subEps = (epDetail.sub || []).map(Number).sort((a, b) => a - b);
   const dubEps = (epDetail.dub || []).map(Number).sort((a, b) => a - b);
   const buildList = (nums, audio) => nums.map(n => {
@@ -1067,7 +1122,7 @@ async function mkHandleWatch(anilistId, audio, epNum) {
   const ck = `mk-watch:${anilistId}:${audio}:${epNum}`;
   const c = getCached(ck); if (c) return c;
   const { showId, show, anizip } = await mkResolveMkissaId(anilistId);
-  await mkWarmWatchPage(showId, show, epNum, audio);
+  if (show?.slugTime) await mkWarmWatchPage(showId, show, epNum, audio);
   const episode = await mkGetEpisodeSources(showId, epNum, audio);
   if (!episode) throw new Error("Episode not found");
   const sources = await Promise.all((episode.sourceUrls || []).map(mkExtractSource));
@@ -1896,7 +1951,7 @@ app.use(cors());
 app.use(express.json());
 
 // ─── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.8.0", providers: ["anidap", "kaa", "mkissa", "miruro", "desidub"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
+app.get("/health", (_req, res) => res.json({ status: "ok", version: "7.9.0", providers: ["anidap", "kaa", "mkissa", "miruro", "desidub"], uptime: Math.floor(process.uptime()), mem: Math.round(process.memoryUsage().heapUsed / 1024 / 1024) + "MB" }));
 
 // ─── HLS Proxy ────────────────────────────────────────────────────────────────
 app.get("/hls-proxy", hlsProxy);
