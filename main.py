@@ -439,7 +439,9 @@ async def get_episodes(anime_id: str):
 async def get_servers(ids: str):
     """Get server list for an episode (calls ajax/server/list).
     ids = the data-ids value from the episode list."""
-    cache_key = f"srv_{ids[:50]}"  # Truncate for cache key
+    # Use hash for cache key — the data-ids strings can be very long (300+ chars)
+    # and truncating them causes cache collisions between different anime
+    cache_key = f"srv_{hashlib.md5(ids.encode()).hexdigest()}"
     if cache_key in SERVER_LIST_CACHE:
         return SERVER_LIST_CACHE[cache_key]
     
@@ -465,7 +467,9 @@ async def get_servers(ids: str):
 async def get_stream_url(link_id: str):
     """Get the stream iframe URL for a server (calls ajax/server?get=).
     link_id = the data-link-id value from the server list."""
-    cache_key = f"stream_{link_id[:50]}"
+    # Use full hash — link_ids share long common prefixes (86+ chars),
+    # so truncating to 50 chars causes cache collisions between different anime
+    cache_key = f"stream_{hashlib.md5(link_id.encode()).hexdigest()}"
     if cache_key in STREAM_URL_CACHE:
         return STREAM_URL_CACHE[cache_key]
     
@@ -496,9 +500,17 @@ async def get_stream_url(link_id: str):
 @app.get("/m3u8/{link_id}")
 async def get_m3u8_url(link_id: str):
     """Get the direct m3u8 URL for an episode (full pipeline).
-    This calls /stream first to get the iframe, then calls megaplay's getSources
-    to extract the m3u8 URL."""
-    cache_key = f"m3u8_{link_id[:50]}"
+    
+    Handles multiple streaming providers:
+    - megaplay.buzz (Vidstream-2, HD-1, HD-2 servers)
+    - vidtube.site  (VidPlay-1 servers)
+    
+    Both use the same /stream/getSources?id={data-id} endpoint, just on
+    their own domain. We use data-id (numeric) which works for both.
+    """
+    # Use full hash — link_ids share long common prefixes,
+    # so truncating causes cache collisions between different anime
+    cache_key = f"m3u8_{hashlib.md5(link_id.encode()).hexdigest()}"
     if cache_key in M3U8_CACHE:
         return M3U8_CACHE[cache_key]
     
@@ -508,45 +520,70 @@ async def get_m3u8_url(link_id: str):
     if not iframe_url:
         raise HTTPException(status_code=404, detail="No iframe URL")
     
-    # Step 2: Fetch the megaplay page to extract data-realid
-    megaplay_html = await fetch_page(iframe_url, headers={"Referer": BASE_URL + "/"})
-    soup = BeautifulSoup(megaplay_html, "html.parser")
+    # Step 2: Fetch the iframe page (megaplay.buzz or vidtube.site) to extract player data
+    iframe_html = await fetch_page(iframe_url, headers={"Referer": BASE_URL + "/"})
+    soup = BeautifulSoup(iframe_html, "html.parser")
     
     player_div = soup.find(id="megaplay-player")
     if not player_div:
-        raise HTTPException(status_code=500, detail="Megaplay player not found")
+        raise HTTPException(status_code=500, detail="Player div not found in iframe page")
     
-    # Try data-realid first, then data-id, then data-mediaid
-    real_id = player_div.get("data-realid") or player_div.get("data-id") or player_div.get("data-mediaid")
-    if not real_id:
-        raise HTTPException(status_code=500, detail="Could not extract media ID from megaplay")
-    
-    # Step 3: Call getSources API
-    # Determine megaplay base URL
-    from urllib.parse import urlparse
+    # Determine the provider's base URL (use the iframe's own domain)
+    from urllib.parse import urlparse, quote
     parsed = urlparse(iframe_url)
-    megaplay_base = f"{parsed.scheme}://{parsed.netloc}"
+    provider_base = f"{parsed.scheme}://{parsed.netloc}"
     
-    sources_url = f"{megaplay_base}/stream/getSources?id={real_id}"
+    # Try different ID attributes — order matters:
+    # 1. data-id (numeric, works for BOTH megaplay and vidtube)
+    # 2. data-mediaid (numeric, works for both as fallback)
+    # 3. data-realid (numeric for megaplay, but a slug string for vidtube — only use if numeric)
+    candidate_ids = []
+    for attr in ["data-id", "data-mediaid", "data-realid"]:
+        val = player_div.get(attr)
+        if val and val not in candidate_ids:
+            # Only add numeric IDs (vidtube's data-realid is a string slug like "anime-name/ep-1")
+            try:
+                int(val)
+                candidate_ids.append(val)
+            except (ValueError, TypeError):
+                pass  # skip non-numeric
+    
+    if not candidate_ids:
+        raise HTTPException(status_code=500, detail="Could not extract numeric media ID from player")
+    
+    # Step 3: Try getSources endpoint on the provider's domain
+    # Try each candidate ID until one returns a valid m3u8
     client = await get_http_client()
-    sources_response = await client.get(
-        sources_url,
-        headers={
-            **DEFAULT_HEADERS,
-            "Referer": iframe_url,
-            "X-Requested-With": "XMLHttpRequest",
-        }
-    )
+    sources_data = None
+    last_error = None
     
-    if sources_response.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"getSources failed: {sources_response.status_code}")
+    for real_id in candidate_ids:
+        sources_url = f"{provider_base}/stream/getSources?id={real_id}"
+        try:
+            sources_response = await client.get(
+                sources_url,
+                headers={
+                    **DEFAULT_HEADERS,
+                    "Referer": iframe_url,
+                    "X-Requested-With": "XMLHttpRequest",
+                }
+            )
+            if sources_response.status_code != 200:
+                last_error = f"getSources returned {sources_response.status_code} for id={real_id}"
+                continue
+            
+            sources_data = sources_response.json()
+            sources = sources_data.get("sources", {})
+            m3u8_url = sources.get("file") if isinstance(sources, dict) else None
+            if m3u8_url:
+                break  # Found it!
+            last_error = f"No m3u8 in sources for id={real_id}"
+        except Exception as e:
+            last_error = f"Error fetching getSources for id={real_id}: {e}"
+            continue
     
-    sources_data = sources_response.json()
-    sources = sources_data.get("sources", {})
-    m3u8_url = sources.get("file") if isinstance(sources, dict) else None
-    
-    if not m3u8_url:
-        raise HTTPException(status_code=404, detail="m3u8 URL not found in sources")
+    if not sources_data or not m3u8_url:
+        raise HTTPException(status_code=502, detail=f"getSources failed: {last_error}")
     
     # Get tracks (subtitles)
     tracks = sources_data.get("tracks", [])
@@ -566,6 +603,7 @@ async def get_m3u8_url(link_id: str):
     result = {
         "link_id": link_id,
         "iframe_url": iframe_url,
+        "provider": parsed.netloc,
         "m3u8_url": m3u8_url,
         "subtitles": subtitles,
         "intro": intro,
@@ -656,12 +694,17 @@ async def get_genre(name: str):
 
 
 @app.get("/full/{slug}/{episode_num}")
-async def get_full_pipeline(slug: str, episode_num: str):
+async def get_full_pipeline(slug: str, episode_num: str, preferred_type: str = "sub"):
     """One-shot endpoint: from anime slug + episode number, get everything including m3u8.
     
+    Tries multiple servers (Vidstream-2, HD-1, HD-2, VidPlay-1) until it finds
+    one that returns a working m3u8 URL. Falls back through the server list
+    so we always return a playable stream when one exists.
+    
     Example: /full/a-silent-voice-fghla/1
+    Optional: /full/a-silent-voice-fghla/1?preferred_type=dub
     """
-    cache_key = f"full_{slug}_{episode_num}"
+    cache_key = f"full_{slug}_{episode_num}_{preferred_type}"
     if cache_key in M3U8_CACHE:
         return M3U8_CACHE[cache_key]
     
@@ -687,16 +730,61 @@ async def get_full_pipeline(slug: str, episode_num: str):
     # Step 4: Get servers for this episode
     servers_data = await get_servers(target_ep["ids"])
     
-    # Step 5: Get m3u8 for the first sub server
-    sub_server = next((s for s in servers_data["servers"] if s["type"] == "sub"), None)
-    if not sub_server:
-        sub_server = servers_data["servers"][0] if servers_data["servers"] else None
+    # Step 5: Try servers in priority order until we find a working m3u8
+    # Priority: 
+    # 1. Servers matching preferred_type (sub/dub/hsub) 
+    # 2. Prefer Vidstream-2 and HD-1 (megaplay.buzz) over VidPlay-1 (vidtube.site) for stability
+    # 3. Fall back to any remaining server
+    all_servers = servers_data["servers"]
     
-    if not sub_server:
+    # Sort servers: preferred_type first, then by name priority
+    name_priority = {"Vidstream-2": 0, "HD-1": 1, "HD-2": 2, "VidPlay-1": 3}
+    def server_sort_key(s):
+        type_match = 0 if s["type"] == preferred_type else 1
+        name_rank = name_priority.get(s["name"], 99)
+        return (type_match, name_rank)
+    
+    sorted_servers = sorted(all_servers, key=server_sort_key)
+    
+    if not sorted_servers:
         raise HTTPException(status_code=404, detail="No servers available")
     
-    # Step 6: Get m3u8
-    m3u8_data = await get_m3u8_url(sub_server["link_id"])
+    # Step 6: Try each server until we get a working m3u8
+    m3u8_data = None
+    used_server = None
+    errors = []
+    
+    for server in sorted_servers:
+        try:
+            candidate_m3u8 = await get_m3u8_url(server["link_id"])
+            if candidate_m3u8 and candidate_m3u8.get("m3u8_url"):
+                m3u8_data = candidate_m3u8
+                used_server = server
+                break
+        except HTTPException as e:
+            errors.append({
+                "server": server["name"],
+                "type": server["type"],
+                "error": e.detail if hasattr(e, "detail") else str(e),
+            })
+            continue
+        except Exception as e:
+            errors.append({
+                "server": server["name"],
+                "type": server["type"],
+                "error": f"{type(e).__name__}: {e}",
+            })
+            continue
+    
+    if not m3u8_data:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": "All servers failed to return m3u8",
+                "errors": errors,
+                "available_servers": all_servers,
+            }
+        )
     
     result = {
         "anime": {
@@ -712,8 +800,8 @@ async def get_full_pipeline(slug: str, episode_num: str):
             "dub": target_ep["dub"],
         },
         "server_used": {
-            "name": sub_server["name"],
-            "type": sub_server["type"],
+            "name": used_server["name"],
+            "type": used_server["type"],
         },
         "all_servers": servers_data["servers"],
         "stream": m3u8_data,
